@@ -1,0 +1,18 @@
+services:
+  review:
+    build: .
+    image: copy-review-redact:latest
+    container_name: copy-review
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # 生产部署请务必修改下面两个密码
+      AUTHOR_PASSWORD: "${AUTHOR_PASSWORD:-author123}"
+      REVIEWER_PASSWORD: "${REVIEWER_PASSWORD:-reviewer123}"
+      DATA_FILE: /data/review.json
+    volumes:
+      - review-data:/data
+
+volumes:
+  review-data:

@@ -195,14 +195,29 @@ function validateAuthorEdit(oldText, newText) {
   if (totalMarks !== newMasks.length * 2) return '正文中不允许使用 ⟦ 或 ⟧ 字符';
   const oldMasks = extractMasks(oldText);
   if (newMasks.length !== oldMasks.length) return '已确认的遮罩块不可删除或新增';
+  // 数量相同时按顺序一一配对：块长相同且在 token diff 中完全对应到同一个 equal 段。
+  // 逐块比较其 token 序号是否落在同一条 equal op 内且相对顺序一致，
+  // 从而拒绝“块被搬到另一段文字前后”的编辑。
   const A = tokenize(oldText).tokens, B = tokenize(newText).tokens;
   const tokOps = diffOpcodes(A, B, (x, y) => x.kind === y.kind && x.text === y.text);
+  let oi = 0;
   for (const [tag, i1, i2, j1, j2] of tokOps) {
     if (tag !== 'equal') {
       for (let i = i1; i < i2; i++) if (A[i].kind === 'mask') return '已确认的遮罩块不可移动或覆盖到其他文字';
       for (let j = j1; j < j2; j++) if (B[j].kind === 'mask') return '已确认的遮罩块不可移动或覆盖到其他文字';
+      continue;
+    }
+    // equal 段内的 mask token 必须按顺序、等长逐个对应
+    for (let i = i1, j = j1; i < i2; i++, j++) {
+      if (A[i].kind === 'mask' || B[j].kind === 'mask') {
+        if (A[i].kind !== 'mask' || B[j].kind !== 'mask' || A[i].len !== B[j].len) {
+          return '已确认的遮罩块不可移动或覆盖到其他文字';
+        }
+        oi++;
+      }
     }
   }
+  if (oi !== oldMasks.length) return '已确认的遮罩块不可移动或覆盖到其他文字';
   return null;
 }
 

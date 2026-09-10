@@ -6,7 +6,7 @@
   "type": "commonjs",
   "scripts": {
     "start": "node src/server.js",
-    "test": "node test/smoke.js"
+    "test": "node test/smoke.js && node test/http-e2e.js"
   },
   "dependencies": {
     "express": "^4.19.2"

@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>对外文案审阅</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- 登录 -->
+  <section id="loginView" class="card login hidden">
+    <h1>对外文案审阅</h1>
+    <p class="sub">可逆批注 · 不可逆遮罩</p>
+    <label>用户名
+      <select id="loginUser">
+        <option value="author">作者 author</option>
+        <option value="reviewer">审阅人 reviewer</option>
+      </select>
+    </label>
+    <label>密码 <input id="loginPw" type="password" autocomplete="current-password"></label>
+    <button id="loginBtn" class="primary">登录</button>
+    <p id="loginErr" class="error"></p>
+  </section>
+
+  <!-- 对外稿（免登录） -->
+  <section id="externalView" class="hidden">
+    <div class="topbar">
+      <strong id="extTitle"></strong>
+      <span id="extStatus" class="tag"></span>
+      <a href="/" class="right">进入审阅</a>
+    </div>
+    <div class="card">
+      <div id="extContent" class="doc-text external"></div>
+      <p class="hint" id="extHint"></p>
+    </div>
+  </section>
+
+  <!-- 文档列表 -->
+  <section id="listView" class="hidden">
+    <div class="topbar">
+      <strong>文案列表</strong>
+      <span class="right"><span id="whoami"></span> <button id="logoutBtn" class="link">退出</button></span>
+    </div>
+    <div class="card">
+      <table id="docTable">
+        <thead><tr><th>标题</th><th>状态</th><th>版本</th><th>遮罩段</th><th>更新时间</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div id="newDoc" class="hidden">
+        <h3>新建对外文案</h3>
+        <input id="newTitle" maxlength="200" placeholder="标题">
+        <textarea id="newContent" rows="6" placeholder="粘贴原文…"></textarea>
+        <button id="createBtn" class="primary">创建</button>
+      </div>
+      <p class="error" id="listErr"></p>
+    </div>
+  </section>
+
+  <!-- 审阅工作区 -->
+  <section id="docView" class="hidden">
+    <div class="topbar">
+      <button id="backBtn" class="link">← 列表</button>
+      <strong id="docTitle"></strong>
+      <span id="docStatus" class="tag"></span>
+      <span class="muted" id="docVersion"></span>
+      <span class="right">
+        <span id="whoami2"></span>
+        <button id="extLinkBtn" class="link">对外稿链接</button>
+        <button id="closeDocBtn" class="link danger hidden">结束审阅并冻结</button>
+      </span>
+    </div>
+
+    <div class="workspace">
+      <div class="main card">
+        <div class="toolbar">
+          <div id="selectHint" class="hint">审阅人：在正文上拖选文字即可批注或遮罩</div>
+          <div id="selectPop" class="pop hidden">
+            <button data-kind="comment">加批注</button>
+            <button data-kind="suggest">提修改建议</button>
+            <button data-kind="mask" class="danger">划遮罩</button>
+            <span id="selectText" class="muted"></span>
+          </div>
+        </div>
+
+        <!-- 审阅人/只读视图：渲染层，选择文字 -->
+        <div id="contentRender" class="doc-text" tabindex="0"></div>
+
+        <!-- 作者改原文 -->
+        <div id="authorEdit" class="hidden">
+          <h3>修改原文</h3>
+          <p class="hint">未结束的批注会自动跟随位置；被改没的字上的批注会标记“失去位置”，不会错批到别处。
+            <b>⟦██…⟧ 是已确认遮罩，不能删改或移动。</b></p>
+          <textarea id="contentInput" rows="14"></textarea>
+          <div class="row">
+            <button id="saveContentBtn" class="primary">保存原文（批注自动跟随）</button>
+            <button id="cancelEditBtn">放弃修改</button>
+            <span id="editMsg" class="error"></span>
+          </div>
+        </div>
+
+        <div class="row" id="docActions"></div>
+      </div>
+
+      <aside class="side">
+        <div class="card">
+          <h3>待处理批注</h3>
+          <div id="annList"></div>
+        </div>
+        <div class="card" id="maskCard">
+          <h3>不可逆遮罩</h3>
+          <p class="hint">确认前可预览对外效果；确认后被遮的字从正文和历史中永久抹除，作者和审阅人都无法再读到。</p>
+          <div id="maskList"></div>
+          <button id="previewMaskBtn" class="danger">预览遮罩后的对外稿</button>
+        </div>
+        <div class="card">
+          <h3>历史</h3>
+          <div id="eventList" class="events"></div>
+        </div>
+      </aside>
+    </div>
+  </section>
+
+  <!-- 批注编辑弹层 -->
+  <div id="annModal" class="modal hidden">
+    <div class="modal-box card">
+      <h3 id="annModalTitle"></h3>
+      <div id="annModalBody"></div>
+      <div class="row right">
+        <button id="annModalCancel">取消</button>
+        <button id="annModalOk" class="primary">提交</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 遮罩预览弹层 -->
+  <div id="maskModal" class="modal hidden">
+    <div class="modal-box card wide">
+      <h3>遮罩后的对外稿（预览，尚未生效）</h3>
+      <div id="maskPreview" class="doc-text external preview"></div>
+      <div id="maskSealWarn" class="warn hidden"></div>
+      <p class="hint">勾选要确认的遮罩段：</p>
+      <div id="maskChecks"></div>
+      <div class="row right">
+        <button id="maskModalCancel">取消</button>
+        <button id="maskModalOk" class="danger">确认遮罩（不可恢复）</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="app.js"></script>
+</body>
+</html>
