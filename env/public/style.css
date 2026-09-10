@@ -52,6 +52,8 @@ button.link.danger { color: var(--red); background: none; }
 .tag { font-size: 12px; padding: 2px 8px; border-radius: 10px; border: 1px solid var(--border); }
 .tag.open { background: #ecfdf5; color: var(--green); border-color: #a7f3d0; }
 .tag.closed { background: #f4f4f5; color: #52525b; }
+.tag.derived { background: #eff6ff; color: var(--blue); border-color: #bfdbfe; margin-left: 6px; }
+.tag.master { background: #fff7ed; color: var(--amber); border-color: #fed7aa; margin-left: 6px; }
 
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #eee; }

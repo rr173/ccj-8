@@ -92,6 +92,12 @@ app.post('/api/docs', requireAuth(['author']), async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+app.post('/api/docs/:id/derive', requireAuth(['author']), async (req, res, next) => {
+  try {
+    res.status(201).json(await service.deriveDoc(req.params.id, req.body && req.body.title, req.user.name));
+  } catch (e) { next(e); }
+});
+
 app.get('/api/docs/:id', requireAuth(), async (req, res, next) => {
   try {
     const doc = await service.getDoc(req.params.id);

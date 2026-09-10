@@ -25,6 +25,11 @@ function req(role, method, url, body) {
 }
 const cookieName = 'rv_session';
 const jars = {};
+// 子串的 code-point 位置（批注/遮罩接口用 code-point 偏移）
+function cpIndexOf(s, sub) {
+  const i = s.indexOf(sub);
+  return i < 0 ? i : Array.from(s.slice(0, i)).length;
+}
 
 async function login(role, pw) {
   const res = await req(null, 'POST', '/api/login', { username: role, password: pw });
@@ -131,6 +136,59 @@ async function waitReady() {
     const frozen = await req('reviewer', 'POST', `/api/docs/${id}/annotations`,
       { kind: 'comment', start: 0, end: 1, note: 'x' });
     ok('冻结后不能批注', frozen.status === 409);
+
+    console.log('C) 派生投放稿（母稿 → 投放稿同步）');
+    const mText = '首段公开。二段代号TOPSECRET9尾。\n三段普通。';
+    const mc = await req('author', 'POST', '/api/docs', { title: '母稿', content: mText });
+    ok('建母稿 201', mc.status === 201);
+    const mid = mc.body.id;
+    const tPos = cpIndexOf(mText, 'TOPSECRET9');
+    await req('reviewer', 'POST', `/api/docs/${mid}/annotations`,
+      { kind: 'mask', start: tPos, end: tPos + 10, version: 1 });
+    let vv = (await req('reviewer', 'GET', `/api/docs/${mid}`)).body.version;
+    await req('reviewer', 'POST', `/api/docs/${mid}/masks/confirm`, { version: vv });
+    ok('审阅人不能派生', (await req('reviewer', 'POST', `/api/docs/${mid}/derive`, {})).status === 403);
+    const der = await req('author', 'POST', `/api/docs/${mid}/derive`, { title: '投放稿A' });
+    ok('派生 201', der.status === 201);
+    const kid = der.body.id;
+    ok('派生稿与母稿同一份字且遮罩已带过去',
+      !der.body.content.includes('TOPSECRET9') && der.body.content.includes('⟦██████████⟧'));
+    ok('派生稿 parentId 正确', der.body.parentId === mid);
+    const listC = (await req('author', 'GET', '/api/docs')).body;
+    ok('列表带派生关系', listC.find(d => d.id === mid).derived === 1 && listC.find(d => d.id === kid).parentId === mid);
+
+    // 母稿改未遮的字 → 投放稿跟着变
+    const mCur = (await req('author', 'GET', `/api/docs/${mid}`)).body;
+    await req('author', 'PUT', `/api/docs/${mid}/content`,
+      { content: mCur.content.replace('三段普通', '三段更新'), version: mCur.version });
+    const kCur = (await req('reviewer', 'GET', `/api/docs/${kid}`)).body;
+    ok('投放稿跟着母稿改字', kCur.content.includes('三段更新'));
+
+    // 母稿确认新遮罩 → 投放稿跟着遮掉同一段
+    const mCur2 = (await req('reviewer', 'GET', `/api/docs/${mid}`)).body;
+    const pPos = cpIndexOf(mCur2.content, '三段更新');
+    await req('reviewer', 'POST', `/api/docs/${mid}/annotations`,
+      { kind: 'mask', start: pPos, end: pPos + 4, version: mCur2.version });
+    vv = (await req('reviewer', 'GET', `/api/docs/${mid}`)).body.version;
+    await req('reviewer', 'POST', `/api/docs/${mid}/masks/confirm`, { version: vv });
+    const kCur2 = (await req('reviewer', 'GET', `/api/docs/${kid}`)).body;
+    ok('投放稿跟着遮掉同一段', !kCur2.content.includes('三段更新') && kCur2.content.includes('⟦████⟧'));
+
+    // 对外看投放稿只能看到它遮完后的字（免登录）
+    const kExt = (await req(null, 'GET', `/api/docs/${kid}/external`)).body;
+    ok('投放稿对外稿只有遮完的字',
+      !kExt.content.includes('TOPSECRET9') && !kExt.content.includes('三段更新') && kExt.content.includes('████'));
+
+    // 投放稿自己确认遮罩，不写回母稿
+    const kCur3 = (await req('reviewer', 'GET', `/api/docs/${kid}`)).body;
+    const sPos = cpIndexOf(kCur3.content, '首段公开');
+    await req('reviewer', 'POST', `/api/docs/${kid}/annotations`,
+      { kind: 'mask', start: sPos, end: sPos + 4, version: kCur3.version });
+    vv = (await req('reviewer', 'GET', `/api/docs/${kid}`)).body.version;
+    await req('reviewer', 'POST', `/api/docs/${kid}/masks/confirm`, { version: vv });
+    ok('投放稿遮罩不写回母稿', (await req('reviewer', 'GET', `/api/docs/${mid}`)).body.content.includes('首段公开'));
+    ok('落盘文件无被遮文字',
+      !fs.readFileSync(dataFile, 'utf8').includes('TOPSECRET9') && !fs.readFileSync(dataFile, 'utf8').includes('三段更新'));
 
     console.log(`\nHTTP 端到端全部通过：${passed} 项`);
   } finally {

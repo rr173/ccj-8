@@ -223,6 +223,67 @@ function validateAuthorEdit(oldText, newText) {
 
 function cpLen(s) { return codePoints(s).length; }
 
+// ---------- 母稿 → 投放稿：段落级三方合并 ----------
+// base   = 投放稿记录的母稿正文（上次同步时）；master = 母稿当前正文；child = 投放稿当前正文。
+// 以“段”（换行分隔）为单位：
+//   - 母稿改了、投放稿没改的段 → 跟着母稿变；
+//   - 投放稿自己改过的段 → 保留投放稿的，不被母稿盖掉；
+//   - 母稿删了、投放稿没改 → 删；母稿删了、投放稿改过 → 保留投放稿的；
+//   - 双方在同一段边界各自插入 → 都保留（完全相同的插入只留一份）。
+// 遮罩块不走合并：母稿确认遮罩由 _propagateMasks 强制替换（改过的段也逃不掉）。
+function mergeParagraphs(base, master, child) {
+  if (child === base) return master;   // 投放稿没动过 → 整份跟母稿
+  if (master === base) return child;   // 母稿没变 → 不动
+  const B = base.split('\n'), M = master.split('\n'), C = child.split('\n');
+  const eq = (x, y) => x === y;
+  const mSide = paragraphMap(diffOpcodes(B, M, eq), M);
+  const cSide = paragraphMap(diffOpcodes(B, C, eq), C);
+  const out = [];
+  for (let i = 0; i <= B.length; i++) {
+    // 段边界 i 上双方各自插入的段：都保留，完全相同的去重
+    const ci = cSide.ins.get(i) || [];
+    const pool = ci.slice();
+    out.push(...ci);
+    for (const t of (mSide.ins.get(i) || [])) {
+      const k = pool.indexOf(t);
+      if (k >= 0) pool.splice(k, 1);
+      else out.push(t);
+    }
+    if (i === B.length) break;
+    const m = mSide.map[i], c = cSide.map[i];
+    if (c.type === 'deleted') continue;              // 投放稿自己删了这段
+    if (m.type === 'deleted') {                      // 母稿删了这段
+      if (c.type === 'changed') out.push(c.text);    // 投放稿改过 → 保留
+      continue;
+    }
+    out.push(c.type === 'same' ? m.text : c.text);   // 没改过跟母稿；改过保留本地
+  }
+  return out.join('\n');
+}
+
+// 把 base→next 的段落 diff 汇总成：map[i] = base 第 i 段的去向，ins = 各段边界上新增的段
+function paragraphMap(ops, next) {
+  const map = [], ins = new Map();
+  const addIns = (boundary, texts) => {
+    if (texts.length) ins.set(boundary, (ins.get(boundary) || []).concat(texts));
+  };
+  for (const [tag, i1, i2, j1, j2] of ops) {
+    if (tag === 'equal') {
+      for (let k = 0; k < i2 - i1; k++) map[i1 + k] = { type: 'same', text: next[j1 + k] };
+    } else if (tag === 'delete') {
+      for (let i = i1; i < i2; i++) map[i] = { type: 'deleted' };
+    } else if (tag === 'insert') {
+      addIns(i1, next.slice(j1, j2));
+    } else { // replace：对齐配对算“改”，多出来的按删/插处理
+      const paired = Math.min(i2 - i1, j2 - j1);
+      for (let k = 0; k < paired; k++) map[i1 + k] = { type: 'changed', text: next[j1 + k] };
+      for (let i = i1 + paired; i < i2; i++) map[i] = { type: 'deleted' };
+      addIns(i1 + paired, next.slice(j1 + paired, j2));
+    }
+  }
+  return { map, ins };
+}
+
 // ---------- 密码哈希 & 签名 ----------
 function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
   const hash = crypto.scryptSync(password, salt, 32).toString('hex');
@@ -259,5 +320,6 @@ function randomToken() { return crypto.randomBytes(24).toString('hex'); }
 module.exports = {
   codePoints, diffOpcodes, mapRange, contentOpcodes,
   MARK, MARK_END, maskBlock, extractMasks, tokenize, validateAuthorEdit, cpLen,
+  mergeParagraphs,
   hashPassword, verifyPassword, sign, unsign, randomToken,
 };

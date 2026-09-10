@@ -10,6 +10,11 @@ const util = require('../src/util');
 
 let passed = 0;
 function ok(name, cond) { assert.ok(cond, name); console.log('  ✓', name); passed++; }
+// 子串的 code-point 位置（批注/遮罩接口用 code-point 偏移）
+function cpIndexOf(s, sub) {
+  const i = s.indexOf(sub);
+  return i < 0 ? i : Array.from(s.slice(0, i)).length;
+}
 
 async function main() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'review-'));
@@ -134,6 +139,128 @@ async function main() {
   const err5 = await svc.addAnnotation({ docId: doc.id, kind: 'comment', start: 0, end: 1, note: 'x' }, 'reviewer', null)
     .then(() => null, e => e);
   ok('冻结后不能批注', err5 && err5.status === 409);
+
+  console.log('13) 派生：与母稿同一份字，已确认遮罩一并带过去');
+  const mContent = '第一段：公开文字甲，内部代号OMEGA七。\n第二段：报价九千万元整。\n第三段：联系方式保密。';
+  const master = await svc.createDoc('母稿', mContent, 'author');
+  const oPos = cpIndexOf(mContent, 'OMEGA');
+  await svc.addAnnotation({ docId: master.id, kind: 'mask', start: oPos, end: oPos + 5, note: '' }, 'reviewer', 1);
+  await svc.confirmMasks(master.id, null, 'reviewer', 1);
+  const masterDoc = await svc.getDoc(master.id);
+  ok('母稿遮罩已确认', masterDoc.content.includes('⟦█████⟧') && !masterDoc.content.includes('OMEGA'));
+  const k1 = await svc.deriveDoc(master.id, '', 'author');
+  const k2 = await svc.deriveDoc(master.id, '渠道B稿', 'author');
+  ok('派生稿与母稿同一份字', k1.content === masterDoc.content && k2.content === masterDoc.content);
+  ok('已确认遮罩在派生稿里就是遮着的', k1.content.includes('⟦█████⟧'));
+  ok('派生稿不带母稿批注', (await svc.annotations(k1.id)).length === 0);
+  ok('列表带派生关系', (await svc.listDocs()).find(d => d.id === master.id).derived === 2);
+
+  console.log('14) 母稿改未遮的字：没改过的段跟着变，改过的段不被盖掉');
+  // k1 自己改第一段和第二段（第二段保留“九千万元”，追加“（含税）”）
+  const k1Doc0 = await svc.getDoc(k1.id);
+  const k1Local = k1Doc0.content.replace('公开文字甲', '公开文字甲改').replace('报价九千万元整', '报价九千万元整（含税）');
+  await svc.editContent(k1.id, k1Local, 'author', 1);
+  // 母稿改第一段和第三段
+  const mEdit = masterDoc.content.replace('公开文字甲', '公开文字乙').replace('联系方式保密', '联系方式见官网');
+  await svc.editContent(master.id, mEdit, 'author', 2);
+  let k1After = await svc.getDoc(k1.id);
+  let k2After = await svc.getDoc(k2.id);
+  ok('k1 自己改过的段不被母稿盖掉', k1After.content.includes('公开文字甲改') && !k1After.content.includes('公开文字乙'));
+  ok('k1 没改过的段跟着母稿变', k1After.content.includes('联系方式见官网'));
+  ok('k1 本地第二段保持', k1After.content.includes('报价九千万元整（含税）'));
+  ok('k2 没改过 → 完全跟着母稿', k2After.content.includes('公开文字乙') && k2After.content.includes('联系方式见官网'));
+
+  console.log('15) 母稿确认新遮罩：各投放稿跟着遮掉，改过的段也不留原文');
+  // k1 上先有：一条盖住“九千万元”的批注（会被封存）、一条盖第三段的批注（会跟着移位）
+  const k1Doc1 = await svc.getDoc(k1.id);
+  const p9 = cpIndexOf(k1Doc1.content, '九千万元');
+  const sealAnn = await svc.addAnnotation({ docId: k1.id, kind: 'comment', start: p9, end: p9 + 4, note: 'SECRETNOTE2' }, 'reviewer', k1Doc1.version);
+  const p3 = cpIndexOf(k1Doc1.content, '联系方式见官网');
+  const moveAnn = await svc.addAnnotation({ docId: k1.id, kind: 'comment', start: p3, end: p3 + 7, note: '第三段批注' }, 'reviewer', k1Doc1.version);
+  // 母稿确认遮掉“九千万元”
+  const mDoc2 = await svc.getDoc(master.id);
+  const m9 = cpIndexOf(mDoc2.content, '九千万元');
+  await svc.addAnnotation({ docId: master.id, kind: 'mask', start: m9, end: m9 + 4, note: '' }, 'reviewer', mDoc2.version);
+  await svc.confirmMasks(master.id, null, 'reviewer', mDoc2.version);
+  k1After = await svc.getDoc(k1.id);
+  k2After = await svc.getDoc(k2.id);
+  ok('母稿原文已抹除', !(await svc.getDoc(master.id)).content.includes('九千万元'));
+  ok('k1 改过的段也跟着遮掉', !k1After.content.includes('九千万元') && k1After.content.includes('⟦████⟧'));
+  ok('k1 本地改动（含税）仍在', k1After.content.includes('（含税）'));
+  ok('k2 跟着遮掉', !k2After.content.includes('九千万元') && k2After.content.includes('⟦████⟧'));
+  const k1Anns = await svc.annotations(k1.id);
+  const sealed2 = k1Anns.find(a => a.id === sealAnn.id);
+  ok('与同步遮罩重叠的批注被封存', sealed2.status === 'sealed' && sealed2.note === null);
+  ok('封存后批注列表无备注原文', !JSON.stringify(k1Anns).includes('SECRETNOTE2'));
+  const moved2 = k1Anns.find(a => a.id === moveAnn.id);
+  ok('同步遮罩时未确认批注跟着位置走', moved2.status === 'proposed' && moved2.covered === '联系方式见官网');
+
+  console.log('16) 投放稿自己的批注/遮罩只动这一份；两份投放稿互不覆盖');
+  // k1 自己遮“甲改”
+  const k1Doc2 = await svc.getDoc(k1.id);
+  const pj = cpIndexOf(k1Doc2.content, '甲改');
+  await svc.addAnnotation({ docId: k1.id, kind: 'mask', start: pj, end: pj + 2, note: '' }, 'reviewer', k1Doc2.version);
+  const mBefore = (await svc.getDoc(master.id)).content;
+  const k2Before = (await svc.getDoc(k2.id)).content;
+  await svc.confirmMasks(k1.id, null, 'reviewer', k1Doc2.version);
+  ok('k1 自己的遮罩生效', !(await svc.getDoc(k1.id)).content.includes('甲改'));
+  ok('派生稿遮罩不写回母稿', (await svc.getDoc(master.id)).content === mBefore);
+  ok('另一份投放稿不受影响', (await svc.getDoc(k2.id)).content === k2Before);
+  // 打回只恢复这一份
+  const k1Doc3 = await svc.getDoc(k1.id);
+  const sg = await svc.addAnnotation({ docId: k1.id, kind: 'suggest', start: 0, end: 3, note: '', replacement: '第某段' }, 'reviewer', k1Doc3.version);
+  await svc.resolveAnnotation(k1.id, sg.id, 'reject', 'author', k1Doc3.version);
+  ok('k1 打回后本稿原文不变', (await svc.getDoc(k1.id)).content === k1Doc3.content);
+  ok('打回不碰母稿', (await svc.getDoc(master.id)).content === mBefore);
+  // 两份投放稿各自改第三段，互不覆盖
+  await svc.editContent(k1.id, (await svc.getDoc(k1.id)).content.replace('联系方式见官网', '联系方式见官网首页'), 'author', (await svc.getDoc(k1.id)).version);
+  await svc.editContent(k2.id, (await svc.getDoc(k2.id)).content.replace('联系方式见官网', '联系方式见官网底部'), 'author', (await svc.getDoc(k2.id)).version);
+  ok('k1 的改法保留', (await svc.getDoc(k1.id)).content.includes('联系方式见官网首页'));
+  ok('k2 的改法保留', (await svc.getDoc(k2.id)).content.includes('联系方式见官网底部'));
+  // 改某一份时，这一份上未确认的批注跟着位置走
+  const k2Doc = await svc.getDoc(k2.id);
+  const pw = cpIndexOf(k2Doc.content, '公开文字乙');
+  const followAnn = await svc.addAnnotation({ docId: k2.id, kind: 'comment', start: pw, end: pw + 5, note: '跟随我' }, 'reviewer', k2Doc.version);
+  await svc.editContent(k2.id, '【置顶】' + k2Doc.content, 'author', k2Doc.version);
+  const followed = (await svc.annotations(k2.id)).find(a => a.id === followAnn.id);
+  ok('改某一份时该份批注跟着位置走', followed.status === 'proposed' && followed.covered === '公开文字乙');
+  // 对外看某一份只能看到那一份遮完后的字
+  const ext1 = await svc.external(k1.id);
+  ok('k1 对外稿无 k1 已遮文字', !ext1.content.includes('甲改') && !ext1.content.includes('九千万元') && ext1.content.includes('██'));
+  const ext2 = await svc.external(k2.id);
+  ok('k2 对外稿是 k2 自己的字', ext2.content.includes('公开文字乙') && !ext2.content.includes('甲改'));
+
+  console.log('17) 已冻结的投放稿：文字不再同步，遮罩仍强制同步');
+  await svc.closeDoc(k2.id, 'reviewer');
+  const mDoc3 = await svc.getDoc(master.id);
+  await svc.editContent(master.id, mDoc3.content.replace('公开文字乙', '公开文字丙'), 'author', mDoc3.version);
+  ok('冻结的投放稿不跟文字同步', (await svc.getDoc(k2.id)).content.includes('公开文字乙'));
+  ok('k1 自己改过的段也不被这次母稿改动盖掉', (await svc.getDoc(k1.id)).content.includes('公开文字⟦██⟧'));
+  // 母稿确认遮“见官网” → k2 冻结也必须遮掉
+  const mDoc4 = await svc.getDoc(master.id);
+  const pg = cpIndexOf(mDoc4.content, '见官网');
+  await svc.addAnnotation({ docId: master.id, kind: 'mask', start: pg, end: pg + 3, note: '' }, 'reviewer', mDoc4.version);
+  await svc.confirmMasks(master.id, null, 'reviewer', mDoc4.version);
+  const k2Frozen = await svc.getDoc(k2.id);
+  ok('冻结的投放稿也跟着遮掉', !k2Frozen.content.includes('见官网') && k2Frozen.content.includes('⟦███⟧'));
+  const k1After2 = await svc.getDoc(k1.id);
+  ok('k1 本地段里的同样文字也被遮掉', !k1After2.content.includes('见官网') && k1After2.content.includes('首页'));
+
+  console.log('18) 级联派生 + 落盘无任何被遮原文');
+  const g = await svc.deriveDoc(k1.id, '孙稿', 'author');
+  const mDoc5 = await svc.getDoc(master.id);
+  const pl = cpIndexOf(mDoc5.content, '联系方式');
+  await svc.addAnnotation({ docId: master.id, kind: 'mask', start: pl, end: pl + 4, note: '' }, 'reviewer', mDoc5.version);
+  await svc.confirmMasks(master.id, null, 'reviewer', mDoc5.version);
+  const gDoc = await svc.getDoc(g.id);
+  ok('孙稿级联遮掉同一段', !gDoc.content.includes('联系方式') && gDoc.content.includes('⟦████⟧'));
+  ok('孙稿基准版本跟着 k1 走', gDoc.baseVersion === (await svc.getDoc(k1.id)).version);
+  const raw2 = fs.readFileSync(path.join(tmp, 'data.json'), 'utf8');
+  for (const secret of ['OMEGA', '九千万元', '甲改', '见官网', '联系方式', 'SECRETNOTE2']) {
+    ok(`落盘文件无「${secret}」`, !raw2.includes(secret));
+  }
+  const allEvents = await svc.events(null, 5000);
+  ok('全部历史无被遮原文', !['OMEGA', '九千万元', '甲改', '见官网', 'SECRETNOTE2'].some(s => JSON.stringify(allEvents).includes(s)));
 
   console.log(`\n全部通过：${passed} 项断言`);
 }

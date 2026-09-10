@@ -92,15 +92,30 @@ async function loadDocs() {
   const tb = $('#docTable tbody');
   tb.innerHTML = state.docs.map(d => `
     <tr>
-      <td>${esc(d.title)}</td>
+      <td>${esc(d.title)}
+        ${d.parentId ? '<span class="tag derived">投放稿</span>' : ''}
+        ${d.derived ? `<span class="tag master">母稿 ×${d.derived}</span>` : ''}</td>
       <td>${d.status === 'open' ? '<span class="tag open">审阅中</span>' : '<span class="tag closed">已冻结</span>'}</td>
       <td>v${d.version}</td>
       <td>${d.masks}</td>
       <td>${fmtTime(d.updatedAt)}</td>
       <td><button data-id="${d.id}" class="link open-doc">打开</button>
+          ${state.me.role === 'author' ? `<button data-id="${d.id}" class="link derive-doc">派生</button>` : ''}
           <a href="#/ext/${d.id}" class="open-ext">对外稿</a></td>
     </tr>`).join('');
   tb.querySelectorAll('.open-doc').forEach(b => b.onclick = () => openDoc(b.dataset.id));
+  tb.querySelectorAll('.derive-doc').forEach(b => b.onclick = () => deriveDoc(b.dataset.id));
+}
+
+// 从母稿派生一份投放稿：与母稿同一份字，已确认遮罩一并带过去
+async function deriveDoc(id) {
+  const title = prompt('投放稿标题（留空自动命名）：', '');
+  if (title === null) return;
+  try {
+    const doc = await api('POST', `/api/docs/${id}/derive`, { title: title.trim() || undefined });
+    toast('已派生：' + doc.title);
+    await openDoc(doc.id);
+  } catch (e) { toast(e.message); }
 }
 $('#createBtn').onclick = async () => {
   $('#listErr').textContent = '';
@@ -149,6 +164,7 @@ async function openDoc(id) {
   }, 5000);
 }
 $('#backBtn').onclick = () => { clearInterval(state.pollTimer); showList(); };
+$('#deriveBtn').onclick = () => deriveDoc(state.doc.id);
 $('#extLinkBtn').onclick = () => {
   const url = location.origin + '/#/ext/' + state.doc.id;
   navigator.clipboard?.writeText(url).then(() => toast('对外稿链接已复制：' + url), () => toast(url, 4000));
@@ -193,6 +209,17 @@ function renderDoc(opts = {}) {
   $('#docStatus').textContent = doc.status === 'open' ? '审阅中' : '已冻结';
   $('#docStatus').className = 'tag ' + doc.status;
   $('#docVersion').textContent = 'v' + doc.version + ' · 更新于 ' + fmtTime(doc.updatedAt);
+  // 派生关系：投放稿显示母稿链接；母稿显示已派生份数
+  const lin = $('#docLineage');
+  if (doc.parent) {
+    lin.innerHTML = `· 投放稿，母稿 <a href="#" class="parent-link">${esc(doc.parent.title)}</a>`;
+    lin.querySelector('.parent-link').onclick = e => { e.preventDefault(); openDoc(doc.parent.id); };
+  } else if (doc.derived && doc.derived.length) {
+    lin.textContent = `· 母稿，已派生 ${doc.derived.length} 份投放稿`;
+  } else {
+    lin.textContent = '· 母稿';
+  }
+  $('#deriveBtn').classList.toggle('hidden', state.me.role !== 'author');
   renderContent();
   renderAnnotationList();
   renderMaskCard();
@@ -566,8 +593,10 @@ $('#cancelEditBtn').onclick = () => { $('#contentInput').value = state.doc.conte
 
 // ---------- 历史 ----------
 const EVENT_TEXT = {
-  'doc.create': '创建了文档',
+  'doc.create': d => (d && d.derivedFrom) ? '自母稿派生创建（与母稿同一份字）' : '创建了文档',
+  'doc.derived': d => `派生了投放稿《${d.title}》（与母稿同一份字，已确认遮罩一并带过去）`,
   'doc.edit': d => `修改原文（v${d.fromVersion} → v${d.toVersion}），待处理批注自动跟随位置`,
+  'doc.sync': d => `母稿同步：原文更新（v${d.fromVersion} → v${d.toVersion}），本稿自己改过的段保留`,
   'annotation.create': d => `新增${kindName(d.kind)}（${d.len} 字）`,
   'annotation.orphaned': '一条批注因原文改动失去位置（未错批到别处）',
   'annotation.repositioned': '审阅人把失位批注重新定位',
@@ -576,6 +605,7 @@ const EVENT_TEXT = {
   'suggest.accepted': '作者接受修改建议，原文已替换',
   'suggest.rejected': '作者打回修改建议，原文保持不变',
   'mask.confirmed': d => `确认不可逆遮罩 ${d.len} 字（原文已抹除，历史不保留被遮内容）`,
+  'mask.synced': d => `随母稿确认遮罩，本稿同步遮罩 ${d.len} 字${d.count > 1 ? `（${d.count} 处）` : ''}（原文已抹除）`,
   'annotation.sealed': '一条批注因与遮罩重叠被永久封存',
   'review.closed': '审阅结束，对外稿冻结',
 };

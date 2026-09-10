@@ -10,6 +10,7 @@
 const {
   codePoints, contentOpcodes, mapRange, maskBlock, extractMasks,
   validateAuthorEdit, cpLen, MARK, MARK_END, hashPassword, randomToken,
+  mergeParagraphs,
 } = require('./util');
 
 class Service {
@@ -48,11 +49,13 @@ class Service {
     return this.store.read(d => Object.values(d.docs).map(doc => ({
       id: doc.id, title: doc.title, status: doc.status, version: doc.version,
       updatedAt: doc.updatedAt, masks: extractMasks(doc.content).length,
+      parentId: doc.parentId || null,
+      derived: Object.values(d.docs).filter(x => x.parentId === doc.id).length,
     })));
   }
 
   async getDoc(id) {
-    return this.store.read(d => d.docs[id] || null);
+    return this.store.read(d => (d.docs[id] ? this._docView(d, d.docs[id]) : null));
   }
 
   async createDoc(title, content, actor) {
@@ -62,12 +65,44 @@ class Service {
       const doc = {
         id, title, content, version: 1, status: 'open',
         createdAt: now, updatedAt: now, closedAt: null,
+        parentId: null, baseContent: null, baseVersion: null,
       };
       d.docs[id] = doc;
       d._ann = d._ann || {};
       this._event(d, 'doc.create', actor, id, { title });
       return doc;
     });
+  }
+
+  // ---------- 派生投放稿 ----------
+  // 派生时与母稿同一份字：母稿已确认的遮罩块随正文一起复制（原文早已抹除，
+  // 复制的内容里本来就没有），批注与历史不复制 —— 投放稿有自己的审阅空间。
+  async deriveDoc(id, title, actor) {
+    return this.store.tx(d => {
+      const parent = d.docs[id];
+      if (!parent) throw httpError(404, '文档不存在');
+      const n = Object.values(d.docs).filter(x => x.parentId === id).length;
+      const newId = 'doc_' + (++d.counters.doc);
+      const now = new Date().toISOString();
+      const doc = {
+        id: newId,
+        title: (title && String(title).slice(0, 200)) || `${parent.title}（投放稿 ${n + 1}）`,
+        content: parent.content,
+        version: 1, status: 'open',
+        createdAt: now, updatedAt: now, closedAt: null,
+        parentId: parent.id,
+        baseContent: parent.content,   // 三方合并基准：母稿当前正文
+        baseVersion: parent.version,
+      };
+      d.docs[newId] = doc;
+      this._event(d, 'doc.derived', actor, parent.id, { child: newId, title: doc.title });
+      this._event(d, 'doc.create', actor, newId, { title: doc.title, derivedFrom: parent.id });
+      return this._docView(d, doc);
+    });
+  }
+
+  _childrenOf(d, id) {
+    return Object.values(d.docs).filter(x => x.parentId === id);
   }
 
   // 关闭审阅：冻结对外稿
@@ -177,6 +212,9 @@ class Service {
       } else if (kind === 'suggest') {
         if (typeof replacement !== 'string') throw httpError(400, '修改建议需要替换文本');
         if (replacement.length > 10000) throw httpError(400, '替换文本过长');
+        if (replacement.includes(MARK) || replacement.includes(MARK_END)) {
+          throw httpError(400, '替换文本不允许包含 ⟦ 或 ⟧ 字符');
+        }
       }
       d._ann = d._ann || {};
       const id = 'ann_' + (++d.counters.ann);
@@ -254,6 +292,7 @@ class Service {
       // 建议本身成为历史；其坐标按替换段对齐（仅用于显示）
       a.start = a.start; a.end = a.start + cpLen(a.replacement);
       this._event(d, 'suggest.accepted', actor, docId, { annotation: annId, replacedLen: 0 });
+      this._syncChildren(d, doc, actor);
       return { doc: this._docView(d, doc), annotation: this._publicAnnotation(d, docId, a) };
     });
   }
@@ -273,6 +312,7 @@ class Service {
       doc.version += 1;
       doc.updatedAt = new Date().toISOString();
       this._event(d, 'doc.edit', actor, docId, { fromVersion: doc.version - 1, toVersion: doc.version });
+      this._syncChildren(d, doc, actor);
       return this._docView(d, doc);
     });
   }
@@ -341,63 +381,146 @@ class Service {
       // 从后往前把正文文字换成遮罩块
       let content = doc.content;
       const sealed = [];
+      const maskedTexts = []; // 被抹除的原文：只活在本事务内存里用于同步投放稿，不落盘、不进历史
       const sorted = [...anns].sort((x, y) => y.start - x.start);
-      // 逐个替换并重映射其他批注（遮罩块在 token diff 中是原子段）
       for (const a of sorted) {
         const chars = codePoints(content);
+        maskedTexts.push(chars.slice(a.start, a.end).join(''));
         const block = maskBlock(a.end - a.start);
         const next = chars.slice(0, a.start).join('') + block + chars.slice(a.end).join('');
         const ops = contentOpcodes(content, next);
-        // 新遮罩块的区间：从 a.start 起，长度 = 块全长（含 ⟦ ⟧）
-        const blockStart = a.start;
-        const blockEnd = a.start + cpLen(block);
-        for (const other of Object.values(d._ann || {}).filter(x => x.docId === docId && x.id !== a.id)) {
-          if (other.start === null) continue;
-          const m = mapRange(other.start, other.end, ops);
-          if (other.status === 'sealed') {
-            if (m.status === 'mapped') { other.start = m.start; other.end = m.end; }
-            continue;
-          }
-          if (m.status === 'orphaned') {
-            // 被本遮罩块吞掉的活动批注：封存，坐标贴到块上
-            other.start = blockStart; other.end = blockEnd;
-            other.note = null; other.replacement = null;
-            other.status = 'sealed'; other.sealedReason = 'mask-overlap';
-            sealed.push(other.id);
-            this._event(d, 'annotation.sealed', actor, docId, { annotation: other.id, reason: 'mask-overlap' });
-            continue;
-          }
-          // 映射成功后与新遮罩块相交（批注选区含块内部）也封存
-          if (m.start < blockEnd && m.end > blockStart) {
-            other.start = m.start; other.end = m.end;
-            other.note = null; other.replacement = null;
-            other.status = 'sealed'; other.sealedReason = 'mask-overlap';
-            sealed.push(other.id);
-            this._event(d, 'annotation.sealed', actor, docId, { annotation: other.id, reason: 'mask-overlap' });
-          } else if (other.status === 'proposed' || other.status === 'orphaned') {
-            other.start = m.start; other.end = m.end; other.version = doc.version + 1;
-            if (other.status === 'orphaned') other.status = 'proposed';
-          }
-        }
-        content = next;
         // 遮罩提议本身删除：历史里不保留它的选区文字，只留“遮罩 N 字”事件
-        this._event(d, 'mask.confirmed', actor, docId, { len: a.end - a.start });
         delete d._ann[a.id];
+        this._sealAndRemap(d, doc, ops, a.start, a.start + cpLen(block), actor, sealed);
+        content = next;
+        this._event(d, 'mask.confirmed', actor, docId, { len: a.end - a.start });
       }
 
       doc.content = content;
       doc.version += 1;
       doc.updatedAt = new Date().toISOString();
+      // 母稿确认的遮罩：所有已派生的投放稿跟着把同一段遮掉（只向下传播，绝不写回）
+      this._propagateMasks(d, doc, maskedTexts, actor);
       return { doc: this._docView(d, doc), sealed };
     });
   }
 
+  // 遮罩块落进正文后：与块重叠/被吞掉的批注一律封存（备注/替换文清空），
+  // 其余批注按 diff 重定位。确认遮罩与母稿同步遮罩共用这一套。
+  _sealAndRemap(d, doc, ops, blockStart, blockEnd, actor, sealedOut) {
+    for (const other of Object.values(d._ann || {}).filter(x => x.docId === doc.id)) {
+      if (other.start === null) continue;
+      const m = mapRange(other.start, other.end, ops);
+      if (other.status === 'sealed') {
+        if (m.status === 'mapped') { other.start = m.start; other.end = m.end; }
+        continue;
+      }
+      if (m.status === 'orphaned') {
+        // 被本遮罩块吞掉的活动批注：封存，坐标贴到块上
+        other.start = blockStart; other.end = blockEnd;
+        other.note = null; other.replacement = null;
+        other.status = 'sealed'; other.sealedReason = 'mask-overlap';
+        if (sealedOut) sealedOut.push(other.id);
+        this._event(d, 'annotation.sealed', actor, doc.id, { annotation: other.id, reason: 'mask-overlap' });
+        continue;
+      }
+      // 映射成功后与新遮罩块相交（批注选区含块内部）也封存
+      if (m.start < blockEnd && m.end > blockStart) {
+        other.start = m.start; other.end = m.end;
+        other.note = null; other.replacement = null;
+        other.status = 'sealed'; other.sealedReason = 'mask-overlap';
+        if (sealedOut) sealedOut.push(other.id);
+        this._event(d, 'annotation.sealed', actor, doc.id, { annotation: other.id, reason: 'mask-overlap' });
+      } else if (other.status === 'proposed' || other.status === 'orphaned') {
+        other.start = m.start; other.end = m.end; other.version = doc.version + 1;
+        if (other.status === 'orphaned') other.status = 'proposed';
+      }
+    }
+  }
+
+  // ---------- 母稿 → 投放稿：正文同步 ----------
+  // 母稿正文变化（改原文/接受建议）→ 各投放稿按段三方合并：
+  // 投放稿没改过的段跟着母稿变；投放稿自己改过的段保留，不被母稿盖掉。
+  // 已冻结的投放稿不再同步文字（但遮罩仍强制同步，见 _propagateMasks）。
+  _syncChildren(d, parent, actor) {
+    for (const child of this._childrenOf(d, parent.id)) {
+      if (child.status !== 'open') continue;
+      const merged = mergeParagraphs(child.baseContent, parent.content, child.content);
+      child.baseContent = parent.content;
+      child.baseVersion = parent.version;
+      if (merged === child.content) continue;
+      this._remapActive(d, child, merged);
+      child.content = merged;
+      child.version += 1;
+      child.updatedAt = new Date().toISOString();
+      this._event(d, 'doc.sync', actor, child.id, {
+        fromVersion: child.version - 1, toVersion: child.version, source: parent.id,
+      });
+      this._syncChildren(d, child, actor); // 级联：投放稿的投放稿
+    }
+  }
+
+  // ---------- 母稿 → 投放稿：遮罩强制同步 ----------
+  // 母稿确认遮罩 → 所有投放稿（含已冻结的）必须把同一段遮掉：
+  // 不管那段在投放稿里改没改过，原文一个字都不能留。只向下，不写回母稿。
+  _propagateMasks(d, parent, maskedTexts, actor) {
+    for (const child of this._childrenOf(d, parent.id)) {
+      let changed = false;
+      for (const text of maskedTexts) {
+        if (this._maskTextInDoc(d, child, text, actor, parent.id)) changed = true;
+      }
+      child.baseContent = parent.content;
+      child.baseVersion = parent.version;
+      if (changed) {
+        child.version += 1;
+        child.updatedAt = new Date().toISOString();
+      }
+      this._propagateMasks(d, child, maskedTexts, actor); // 级联：投放稿的投放稿
+    }
+  }
+
+  // 把 doc 正文里 text 的每一处出现（已确认遮罩块内部除外）换成遮罩块；
+  // 重叠批注封存、其余批注重定位。与母稿确认同一事务执行，落盘不留 text 副本。
+  _maskTextInDoc(d, doc, text, actor, sourceId) {
+    if (!text) return false;
+    const block = maskBlock(cpLen(text));
+    const blockCpLen = cpLen(block);
+    let replaced = 0;
+    let from = 0; // indexOf 用的 UTF-16 下标
+    for (;;) {
+      const idx = doc.content.indexOf(text, from);
+      if (idx < 0) break;
+      const start = cpLen(doc.content.slice(0, idx));
+      const end = start + cpLen(text);
+      // 已确认遮罩块内部的出现（例如 █）不能动
+      if (extractMasks(doc.content).some(m => start < m.end && end > m.start)) {
+        from = idx + text.length;
+        continue;
+      }
+      const before = doc.content;
+      const chars = codePoints(before);
+      doc.content = chars.slice(0, start).join('') + block + chars.slice(end).join('');
+      this._sealAndRemap(d, doc, contentOpcodes(before, doc.content), start, start + blockCpLen, actor, null);
+      replaced++;
+      from = idx + block.length;
+    }
+    if (replaced) {
+      this._event(d, 'mask.synced', actor, doc.id, { len: cpLen(text), count: replaced, source: sourceId });
+    }
+    return replaced > 0;
+  }
+
   _docView(d, doc) {
+    const parent = doc.parentId ? d.docs[doc.parentId] : null;
     return {
       id: doc.id, title: doc.title, content: doc.content,
       version: doc.version, status: doc.status,
       updatedAt: doc.updatedAt, closedAt: doc.closedAt,
       masks: extractMasks(doc.content),
+      parentId: doc.parentId || null,
+      baseVersion: doc.baseVersion || null,
+      parent: parent ? { id: parent.id, title: parent.title } : null,
+      derived: this._childrenOf(d, doc.id).map(x => ({ id: x.id, title: x.title, status: x.status })),
     };
   }
 }
