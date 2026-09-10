@@ -1,0 +1,14 @@
+{
+  "name": "copy-review-redact",
+  "version": "1.0.0",
+  "description": "对外文案审阅：可逆批注 + 不可逆遮罩",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node test/smoke.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
