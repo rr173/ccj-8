@@ -28,6 +28,7 @@
     <div class="topbar">
       <strong id="extTitle"></strong>
       <span id="extStatus" class="tag"></span>
+      <span id="extChannel" class="muted"></span>
       <a href="/" class="right">进入审阅</a>
     </div>
     <div class="card">
@@ -117,10 +118,14 @@
           <button id="previewMaskBtn" class="danger">预览全部点齐后的对外稿</button>
         </div>
         <div class="card hidden" id="releaseCard">
-          <h3>按段放行（投放）</h3>
+          <h3>按段放行（投放）· 渠道召回</h3>
           <p class="hint">没放行的段，外面打开这一份是<b>完全空白</b>，原文谁也读不到。放行后外面只能看到<b>放行那一刻遮完后的字</b>；
             放行只增不删、不可收回，之后母稿或本稿新增的遮罩会继续追加生效。各投放稿各自独立放行。</p>
+          <p class="hint"><b>渠道召回</b>：对某一渠道下召回令后，该渠道再看这份时被点名的段必须是空的（其他渠道与公开口径不变）；
+            同一渠道对同一段只能召回一次、召回去不能再放亮；召回不改正文。该渠道回传若仍带着被召回的段，记一笔<b>拒不召回</b>，不可抹。</p>
           <div id="releaseList"></div>
+          <h3>召回账</h3>
+          <div id="recallLedger"></div>
         </div>
         <div class="card hidden" id="callbackCard">
           <h3>渠道回传对账</h3>

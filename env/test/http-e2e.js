@@ -333,6 +333,89 @@ async function nodBoth(docId, start, end, version) {
     ok('第一段缺席：记少发', eMiss.body.callback.missing.length === 1
       && eMiss.body.callback.missing[0].index === 0);
 
+    console.log('F) 渠道召回令（点名渠道抽段；拒不召回只追加不可抹）');
+    const rcText = '召回首段甲。\n召回二段乙。\n召回三段丙。';
+    const rcMc = await req('author', 'POST', '/api/docs', { title: '召回母稿', content: rcText });
+    const rcMid = rcMc.body.id;
+    const rcKid = (await req('author', 'POST', `/api/docs/${rcMid}/derive`, { title: '召回投放稿' })).body.id;
+    for (const p of [0, 1, 2]) {
+      const cur = (await req('author', 'GET', `/api/docs/${rcKid}`)).body;
+      await req('author', 'POST', `/api/docs/${rcKid}/release`, { paragraph: p, version: cur.version });
+    }
+    const rcFull = (await req(null, 'GET', `/api/docs/${rcKid}/external`)).body;
+    ok('召回前三段全在', rcFull.content === rcText);
+
+    // 门槛：审阅人无权 / 母稿不收 / 未放行段写不进 / 重复召回拒
+    ok('审阅人不能下召回令', (await req('reviewer', 'POST', `/api/docs/${rcKid}/recalls`,
+      { channel: '渠道甲', paragraphs: [0] })).status === 403);
+    ok('未登录不能下召回令', (await req(null, 'POST', `/api/docs/${rcKid}/recalls`,
+      { channel: '渠道甲', paragraphs: [0] })).status === 401);
+    ok('母稿不支持召回令', (await req('author', 'POST', `/api/docs/${rcMid}/recalls`,
+      { channel: '渠道甲', paragraphs: [0] })).status === 400);
+    ok('召回必须写明渠道', (await req('author', 'POST', `/api/docs/${rcKid}/recalls`,
+      { paragraphs: [0] })).status === 400);
+    ok('召回必须点名段落', (await req('author', 'POST', `/api/docs/${rcKid}/recalls`,
+      { channel: '渠道甲', paragraphs: [] })).status === 400);
+    const rcOther = (await req('author', 'POST', `/api/docs/${rcMid}/derive`, { title: '召回另稿' })).body.id;
+    await req('author', 'POST', `/api/docs/${rcOther}/release`, { paragraph: 0 });
+    ok('没放行过的段写不进召回令', (await req('author', 'POST', `/api/docs/${rcOther}/recalls`,
+      { channel: '渠道甲', paragraphs: [1] })).status === 400);
+
+    // 对渠道甲召回第二段
+    const rcVer = (await req('author', 'GET', `/api/docs/${rcKid}`)).body.version;
+    const order = await req('author', 'POST', `/api/docs/${rcKid}/recalls`,
+      { channel: '渠道甲', paragraphs: [1], version: rcVer });
+    ok('召回令 201', order.status === 201 && order.body.order.paragraphs.join(',') === '1');
+    const vA = (await req(null, 'GET', `/api/docs/${rcKid}/external?channel=${encodeURIComponent('渠道甲')}`)).body;
+    ok('被点名渠道视图抽掉召回段', vA.content === '召回首段甲。\n召回三段丙。'
+      && !vA.content.includes('召回二段乙'));
+    const vB = (await req(null, 'GET', `/api/docs/${rcKid}/external?channel=${encodeURIComponent('渠道乙')}`)).body;
+    ok('未点名渠道仍按放行的看', vB.content === rcText);
+    const vPub = (await req(null, 'GET', `/api/docs/${rcKid}/external`)).body;
+    ok('公开口径不变', vPub.content === rcText);
+    ok('同渠道同段只能召回一次', (await req('author', 'POST', `/api/docs/${rcKid}/recalls`,
+      { channel: '渠道甲', paragraphs: [1] })).status === 409);
+
+    // 回传：渠道甲夹带被召回段 → 泄露 + 拒不召回
+    const cbBad = await req('author', 'POST', `/api/docs/${rcKid}/callbacks`,
+      { channel: '渠道甲', content: rcText });
+    ok('夹带被召回段：不干净、记拒不召回', cbBad.body.callback.clean === false
+      && cbBad.body.callback.refusals.length === 1
+      && cbBad.body.callback.refusals[0].paragraph === 1
+      && cbBad.body.callback.leak.chars > 0);
+    // 渠道丙（没被点名）同样的字 → 干净、无拒不召回
+    const cbOther = await req('author', 'POST', `/api/docs/${rcKid}/callbacks`,
+      { channel: '渠道丙', content: rcText });
+    ok('没被点名的渠道不连坐', cbOther.body.callback.clean === true
+      && cbOther.body.callback.refusals.length === 0);
+    // 渠道甲合规回传：本笔干净，旧账仍在
+    const cbGood = await req('author', 'POST', `/api/docs/${rcKid}/callbacks`,
+      { channel: '渠道甲', content: vA.content });
+    ok('按召回后视图回传：本笔干净', cbGood.body.callback.clean === true);
+    const ledgerA = (await req('reviewer', 'GET',
+      `/api/docs/${rcKid}/recalls?channel=${encodeURIComponent('渠道甲')}`)).body;
+    ok('审阅人也能查召回账；拒不召回只追加', ledgerA.channels[0].refusalCallbacks === 1
+      && ledgerA.channels[0].refusals[0].seq === 1
+      && ledgerA.channels[0].recalledParagraphs.join(',') === '1');
+    const sumA = (await req('author', 'GET',
+      `/api/docs/${rcKid}/callbacks?channel=${encodeURIComponent('渠道甲')}`)).body;
+    ok('回传分渠道汇总带拒不召回笔数', sumA.summary[0].refusalCallbacks === 1);
+    // 另一个渠道对同一段也下召回令：渠道间互不连坐
+    await req('author', 'POST', `/api/docs/${rcKid}/recalls`, { channel: '渠道乙', paragraphs: [1] });
+    const cbBadB = await req('author', 'POST', `/api/docs/${rcKid}/callbacks`,
+      { channel: '渠道乙', content: rcText });
+    ok('渠道乙召回后夹带：记拒不召回', cbBadB.body.callback.refusals.length === 1);
+    const cbC2 = await req('author', 'POST', `/api/docs/${rcKid}/callbacks`,
+      { channel: '渠道丙', content: rcText });
+    ok('渠道丙两笔都干净（这份下过召回也不连坐未点名渠道）', cbC2.body.callback.clean === true);
+    const ledgerAll = (await req('author', 'GET', `/api/docs/${rcKid}/recalls`)).body;
+    ok('召回账可查全部渠道/段号/拒不召回', ledgerAll.orders.length === 2
+      && ledgerAll.channels.filter(g => g.refusalCount > 0).length === 2);
+    // 召回不改正文：内部视图仍是原文
+    ok('召回不改正文', (await req('author', 'GET', `/api/docs/${rcKid}`)).body.content.includes('召回二段乙'));
+    // 文档视图带召回令
+    ok('文档视图带召回令', (await req('author', 'GET', `/api/docs/${rcKid}`)).body.recalls.length === 2);
+
     console.log(`\nHTTP 端到端全部通过：${passed} 项`);
   } finally {
     srv.kill();

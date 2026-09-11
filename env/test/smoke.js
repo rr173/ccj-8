@@ -673,6 +673,135 @@ async function main() {
   ok('只发第一段（第二段没放行、外面本就没有）：无少发、无泄露',
     onlyFirst.callback.clean === true);
 
+  console.log('28) 渠道召回令：点名渠道抽段、其他渠道不变、拒不召回只追加不可抹');
+  const rcText = '召回首段甲。\n召回二段乙。\n召回三段丙。';
+  const rcMaster = await svc.createDoc('召回母稿', rcText, 'author');
+  const rcDoc = await svc.deriveDoc(rcMaster.id, '召回投放稿', 'author');
+  for (let p = 0; p < 3; p++) {
+    await svc.releaseParagraph(rcDoc.id, p, 'author', (await svc.getDoc(rcDoc.id)).version);
+  }
+  const rcFull = (await svc.external(rcDoc.id)).content;
+  ok('召回前公开口径三段都在', rcFull === rcText);
+
+  // 下召回令前的门槛
+  const errRcReviewer = await svc.recallParagraphs(rcDoc.id, '渠道甲', [0], 'reviewer', null).then(() => null, e => e);
+  ok('审阅人不能下召回令', errRcReviewer && errRcReviewer.status === 403);
+  const errRcMaster = await svc.recallParagraphs(rcMaster.id, '渠道甲', [0], 'author', null).then(() => null, e => e);
+  ok('母稿不支持召回令', errRcMaster && errRcMaster.status === 400);
+  const errRcNoChan = await svc.recallParagraphs(rcDoc.id, '   ', [0], 'author', null).then(() => null, e => e);
+  ok('召回令必须写明渠道', errRcNoChan && errRcNoChan.status === 400);
+  const errRcEmpty = await svc.recallParagraphs(rcDoc.id, '渠道甲', [], 'author', null).then(() => null, e => e);
+  ok('召回令必须点名段落', errRcEmpty && errRcEmpty.status === 400);
+  // 另一份没放行第二段的投放稿：没放行过的段写不进召回令
+  const rcDoc2 = await svc.deriveDoc(rcMaster.id, '召回投放稿乙', 'author');
+  await svc.releaseParagraph(rcDoc2.id, 0, 'author', (await svc.getDoc(rcDoc2.id)).version);
+  const errRcUnreleased = await svc.recallParagraphs(rcDoc2.id, '渠道甲', [1], 'author', (await svc.getDoc(rcDoc2.id)).version).then(() => null, e => e);
+  ok('没放行过的段写不进召回令', errRcUnreleased && errRcUnreleased.status === 400);
+  const errRcBadIdx = await svc.recallParagraphs(rcDoc.id, '渠道甲', [99], 'author', (await svc.getDoc(rcDoc.id)).version).then(() => null, e => e);
+  ok('召回段号越界被拒', errRcBadIdx && errRcBadIdx.status === 400);
+
+  // 对渠道甲召回第二段
+  const rcBefore = await svc.getDoc(rcDoc.id);
+  const rcOrder = await svc.recallParagraphs(rcDoc.id, '渠道甲', [1], 'author', rcBefore.version);
+  ok('召回令创建成功', rcOrder.order.id && rcOrder.order.channel === '渠道甲'
+    && rcOrder.order.paragraphs.join(',') === '1');
+  ok('召回推进文档版本', rcOrder.doc.version === rcBefore.version + 1);
+  const rcViewA = await svc.external(rcDoc.id, '渠道甲');
+  ok('被点名渠道再看：这一段必须是空的、原文翻不出来',
+    rcViewA.content === '召回首段甲。\n召回三段丙。' && !rcViewA.content.includes('召回二段乙'));
+  const rcViewB = await svc.external(rcDoc.id, '渠道乙');
+  ok('没被点名的渠道看同一份：还按原来放行的看', rcViewB.content === rcFull);
+  const rcViewPub = await svc.external(rcDoc.id);
+  ok('不带渠道的公开口径不变', rcViewPub.content === rcFull);
+  ok('渠道视图不泄露被召回段（响应整体无该段文字）', JSON.stringify(rcViewA).indexOf('召回二段乙') < 0);
+
+  // 同一渠道对同一段只能召回一次
+  const errRcAgain = await svc.recallParagraphs(rcDoc.id, '渠道甲', [1], 'author', (await svc.getDoc(rcDoc.id)).version).then(() => null, e => e);
+  ok('同渠道同段重复召回被拒', errRcAgain && errRcAgain.status === 409);
+
+  // 回传对账（先于其他渠道召回，保证“没被点名”的对照干净）：
+  // 渠道甲送回全量原文（还带着被召回的第二段）→ 泄露 + 拒不召回
+  const rcBad = await svc.registerCallback(rcDoc.id, '渠道甲', rcFull, 'author');
+  ok('被点名渠道仍送回被召回段：记泄露（该段对该渠道视图是外面没有的字）',
+    rcBad.callback.clean === false && rcBad.callback.leak.chars > 0
+    && rcBad.leakFragments.join('').includes('二段乙'));
+  ok('同时记一笔拒不召回（点名段号）',
+    rcBad.callback.refusals.length === 1 && rcBad.callback.refusals[0].paragraph === 1);
+  // 渠道丙（没被点名）送来完全相同的全量原文 → 干净，不记拒不召回
+  const rcCleanB = await svc.registerCallback(rcDoc.id, '渠道丙', rcFull, 'author');
+  ok('没被点名的渠道送回同一份字：干净，不连坐拒不召回',
+    rcCleanB.callback.clean === true && rcCleanB.callback.refusals.length === 0);
+  // 渠道甲合规回传（只发没召回的两段）→ 本笔干净，无拒不召回
+  const rcGood = await svc.registerCallback(rcDoc.id, '渠道甲', rcViewA.content, 'author');
+  ok('被点名渠道按召回后视图回传：本笔干净',
+    rcGood.callback.clean === true && rcGood.callback.refusals.length === 0);
+  // 旧的拒不召回不能靠再送一次抹掉
+  const rcLedgerA = await svc.recallLedger(rcDoc.id, '渠道甲');
+  ok('再送合规回传也抹不掉拒不召回',
+    rcLedgerA.channels[0].refusalCallbacks === 1 && rcLedgerA.channels[0].refusalCount === 1
+    && rcLedgerA.channels[0].refusals[0].seq === 1);
+  const rcAcctA = await svc.callbacks(rcDoc.id, '渠道甲');
+  ok('回传账首笔拒不召回原样在（只追加）',
+    rcAcctA.callbacks[0].refusals.length === 1 && rcAcctA.summary[0].refusalCallbacks === 1);
+  // 汇总不连坐渠道丙
+  const rcLedgerC = await svc.recallLedger(rcDoc.id, '渠道丙');
+  ok('没召回过的渠道：召回账里查不到渠道组', rcLedgerC.channels.length === 0);
+
+  // 不同渠道召回同一段：各算各的（在对账之后做，不影响上面“未点名”对照）
+  await svc.recallParagraphs(rcDoc.id, '渠道乙', [1], 'author', (await svc.getDoc(rcDoc.id)).version);
+  ok('另一渠道对同一段也可召回（渠道间不连坐）',
+    (await svc.external(rcDoc.id, '渠道乙')).content === '召回首段甲。\n召回三段丙。');
+  // 渠道丙始终未召回：仍是全量
+  ok('渠道丙没被点名：仍是全量', (await svc.external(rcDoc.id, '渠道丙')).content === rcFull);
+  // 渠道乙召回后再送全量原文 → 现在也记拒不召回；渠道丙同样的字依旧干净
+  const rcBadB = await svc.registerCallback(rcDoc.id, '渠道乙', rcFull, 'author');
+  ok('渠道乙召回后再送全量：记拒不召回',
+    rcBadB.callback.refusals.length === 1 && rcBadB.callback.refusals[0].paragraph === 1);
+  const rcCleanC = await svc.registerCallback(rcDoc.id, '渠道丙', rcFull, 'author');
+  ok('渠道丙两笔全量都干净（没被点名的渠道不因这份下过召回被连坐）',
+    rcCleanC.callback.clean === true && rcCleanC.callback.refusals.length === 0);
+
+  const rcLedgerAll = await svc.recallLedger(rcDoc.id);
+  ok('召回账可查这份对哪个渠道召回过哪几段',
+    rcLedgerAll.orders.length === 2
+    && rcLedgerAll.channels.find(g => g.channel === '渠道甲').recalledParagraphs.join(',') === '1'
+    && rcLedgerAll.channels.find(g => g.channel === '渠道乙').refusalCount === 1
+    && rcLedgerAll.channels.find(g => g.channel === '渠道丙') === undefined);
+
+  // 召回不改正文、不抹快照、不救回已遮的字
+  const rcDocView = await svc.getDoc(rcDoc.id);
+  ok('召回不改正文', rcDocView.content.includes('召回二段乙'));
+  ok('召回不改放行快照（公开口径仍全量）', (await svc.external(rcDoc.id)).content === rcFull);
+
+  // 召回全部可见段后该渠道视图为空：空回传干净；空稿不收回传的门仍按全量口径开着
+  const oneMaster = await svc.createDoc('单段召回母稿', '唯一可召回的一段。', 'author');
+  const oneDoc = await svc.deriveDoc(oneMaster.id, '单段投放', 'author');
+  await svc.releaseParagraph(oneDoc.id, 0, 'author', (await svc.getDoc(oneDoc.id)).version);
+  await svc.recallParagraphs(oneDoc.id, '渠道甲', [0], 'author', (await svc.getDoc(oneDoc.id)).version);
+  ok('召回全部可见段：该渠道视图为空', (await svc.external(oneDoc.id, '渠道甲')).content === '');
+  ok('未点名渠道仍看得到', (await svc.external(oneDoc.id)).content === '唯一可召回的一段。');
+  const oneEmpty = await svc.registerCallback(oneDoc.id, '渠道甲', '', 'author');
+  ok('全召回后空回传：干净（不算少发、不算拒不召回）',
+    oneEmpty.callback.clean === true && oneEmpty.callback.refusals.length === 0
+    && oneEmpty.callback.missing.length === 0);
+  const oneRefuse = await svc.registerCallback(oneDoc.id, '渠道甲', '唯一可召回的一段。', 'author');
+  ok('全召回后仍把那段送回来：拒不召回 + 泄露',
+    oneRefuse.callback.refusals.length === 1 && oneRefuse.callback.leak.chars > 0);
+  // 没放行任何段的稿：召回对账的门仍按未放行口径关闭
+  const neverDoc = await svc.deriveDoc(oneMaster.id, '完全没放行稿', 'author');
+  const errGate2 = await svc.registerCallback(neverDoc.id, '渠道甲', '唯一可召回的一段。', 'author').then(() => null, e => e);
+  ok('从没放行的稿仍不收回传', errGate2 && errGate2.status === 409);
+
+  // 拒不召回只记段号/字数：落盘文件里没有召回段的原文指纹以外的东西（段文本仍只在放行快照里）
+  const rawRc = fs.readFileSync(path.join(tmp, 'data.json'), 'utf8');
+  const rcPersist = JSON.parse(rawRc);
+  ok('召回令只存渠道/段号/放行 id，不复制段文本',
+    rcPersist.docs[rcDoc.id].recalls[0].releaseIds[0].startsWith('rel_')
+    && !('text' in rcPersist.docs[rcDoc.id].recalls[0]));
+  ok('拒不召回只记段号与可见字数，不落回传原字',
+    rcPersist.callbacks[rcDoc.id][0].refusals[0].paragraph === 1
+    && typeof rcPersist.callbacks[rcDoc.id][0].refusals[0].chars === 'number');
+
   console.log(`\n全部通过：${passed} 项断言`);
 }
 main().catch(e => { console.error('测试失败:', e); process.exit(1); });

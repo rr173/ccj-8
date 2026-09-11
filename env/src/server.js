@@ -128,10 +128,32 @@ app.post('/api/docs/:id/release', requireAuth(['author']), async (req, res, next
 });
 
 // 对外稿：无需登录（审阅结束后对外发布的版本）
+// 带 ?channel=渠道 时，按该渠道的召回令抽掉被点名的段；不带渠道是公开口径。
 app.get('/api/docs/:id/external', async (req, res, next) => {
-  try { res.json(await service.external(req.params.id)); }
+  try { res.json(await service.external(req.params.id, req.query.channel)); }
   catch (e) { next(e); }
 });
+
+// 渠道召回令（仅作者）：对某一份投放稿、某一个渠道，点名召回已放行的若干段。
+// 下了令后该渠道看这份，这几段必须是空的；同一渠道对同一段只能召回一次。
+app.post('/api/docs/:id/recalls', requireAuth(['author']), async (req, res, next) => {
+  try {
+    const paragraphs = Array.isArray(req.body && req.body.paragraphs)
+      ? req.body.paragraphs
+      : ((req.body && req.body.paragraph !== undefined) ? [req.body.paragraph] : []);
+    const r = await service.recallParagraphs(
+      req.params.id, req.body && req.body.channel, paragraphs,
+      req.user.name, req.body && req.body.version);
+    res.status(201).json(r);
+  } catch (e) { next(e); }
+});
+
+// 查这份对哪个渠道召回过哪几段、有没有拒不召回（审阅人也可查）；?channel= 只看某渠道
+app.get('/api/docs/:id/recalls', requireAuth(), async (req, res, next) => {
+  try { res.json(await service.recallLedger(req.params.id, req.query.channel)); }
+  catch (e) { next(e); }
+});
+
 
 // 渠道回传（仅作者登记）：渠道把实际发出去的字回传，必须写明渠道；
 // 与这一份此刻外面能看见的字对账，泄露/少发各记一笔（只追加、不可改、不可抹）。

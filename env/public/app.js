@@ -11,6 +11,7 @@ const state = {
   annotations: [],
   events: [],
   callbacks: null,
+  recalls: null,
   selection: null,       // {start,end,text}（content 坐标）
   repositionId: null,   // 正在重新定位的批注
   pollTimer: null,
@@ -59,6 +60,8 @@ async function boot() {
     state.me = await api('GET', '/api/me');
     await showList();
   } catch {
+    const m = location.hash.match(/^#\/ext\/([^?]+)(?:\?channel=(.*))?$/);
+    if (m) return showExternal(decodeURIComponent(m[1]), m[2] ? decodeURIComponent(m[2]) : null);
     if (location.hash.startsWith('#/ext/')) return showExternal(location.hash.slice(6));
     show('loginView');
     setTimeout(() => $('#loginPw').focus(), 50);
@@ -129,17 +132,21 @@ $('#createBtn').onclick = async () => {
 };
 
 // ---------- 对外稿 ----------
-async function showExternal(id) {
+async function showExternal(id, channel) {
   show('externalView');
   try {
-    const d = await api('GET', '/api/docs/' + encodeURIComponent(id) + '/external');
+    const qs = channel ? '?channel=' + encodeURIComponent(channel) : '';
+    const d = await api('GET', '/api/docs/' + encodeURIComponent(id) + '/external' + qs);
     $('#extTitle').textContent = d.title;
     $('#extStatus').textContent = d.status === 'closed' ? '已冻结对外版' : '审阅中（内容可能继续变化）';
     $('#extStatus').className = 'tag ' + d.status;
+    $('#extChannel').textContent = channel
+      ? `渠道视图：${channel}（召回令点名的段不显示）`
+      : '公开口径（所有已放行段）';
     $('#extContent').innerHTML = renderExternalHtml(d.content);
     if (!d.content) {
       $('#extHint').textContent = d.released
-        ? ''
+        ? (channel ? '（该渠道被点名召回的段已抽掉，当前没有可显示的段落。）' : '')
         : '（这一份还没有放行任何段落：外面看不到任何内容。）';
       return;
     }
@@ -200,12 +207,14 @@ async function reloadDoc(opts = {}) {
         await api('GET', `/api/docs/${id}/events`),
       ];
     });
-    // 渠道回传账只对投放稿查询
-    let callbacks = null;
+    // 渠道回传账与召回账只对投放稿查询
+    let callbacks = null, recalls = null;
     if (doc.parentId) {
       try { callbacks = await api('GET', `/api/docs/${id}/callbacks`); } catch { callbacks = { callbacks: [], summary: [] }; }
+      try { recalls = await api('GET', `/api/docs/${id}/recalls`); } catch { recalls = { orders: [], channels: [] }; }
     }
-    state.doc = doc; state.annotations = annotations; state.events = events; state.callbacks = callbacks;
+    state.doc = doc; state.annotations = annotations; state.events = events;
+    state.callbacks = callbacks; state.recalls = recalls;
     renderDoc(opts);
   } catch (e) {
     if (!opts.silent) toast(e.message);
@@ -596,6 +605,18 @@ async function openAnnotation(id) {
 function releasedIndexSet() {
   return new Set((state.doc.releases || []).map(r => r.currentIndex).filter(i => i !== null));
 }
+// 段号 → 召回它的渠道列表
+function recalledByIndex() {
+  const map = new Map();
+  for (const o of (state.doc.recalls || [])) {
+    for (const p of o.paragraphs) {
+      const arr = map.get(p) || [];
+      if (!arr.includes(o.channel)) arr.push(o.channel);
+      map.set(p, arr);
+    }
+  }
+  return map;
+}
 function renderReleaseCard() {
   const card = $('#releaseCard');
   // 仅投放稿展示
@@ -605,15 +626,22 @@ function renderReleaseCard() {
   const host = $('#releaseList');
   const rels = state.doc.releases || [];
   const done = releasedIndexSet();
+  const recalled = recalledByIndex();
   const paras = (state.doc.paragraphs || []).map((b, i) => {
     const text = cpSlice(state.doc.content, b.start, b.end);
     const released = done.has(i);
+    const chans = recalled.get(i) || [];
     const preview = text.replace(/⟦█+⟧/g, m => '█'.repeat(Math.max(1, (m.match(/█/g) || []).length)));
+    let badge = released
+      ? `<span class="badge accepted">已放行</span>`
+      : `<span class="badge proposed">未放行</span>`;
+    if (chans.length) badge += `<span class="badge orphaned">已对 ${chans.map(esc).join('、')} 召回</span>`;
     return `<div class="rel-item ${released ? 'done' : ''}">
-      <div class="meta"><span class="badge ${released ? 'accepted' : 'proposed'}">${released ? '已放行' : '未放行'}</span>
+      <div class="meta">${badge}
         <span>第 ${i + 1} 段</span></div>
       <div class="quote rel-quote">${esc(preview.slice(0, 60))}${preview.length > 60 ? '…' : ''}</div>
       ${isAuthor && !released ? `<button class="primary act-release" data-p="${i}">放行此段（不可收回）</button>` : ''}
+      ${isAuthor && released ? `<button class="danger act-recall" data-p="${i}">对某渠道召回此段</button>` : ''}
     </div>`;
   }).join('');
   const orphaned = rels.filter(r => r.currentIndex === null).length;
@@ -622,6 +650,45 @@ function renderReleaseCard() {
   host.querySelectorAll('.act-release').forEach(btn => {
     btn.onclick = () => releaseParagraph(Number(btn.dataset.p));
   });
+  host.querySelectorAll('.act-recall').forEach(btn => {
+    btn.onclick = () => recallParagraph(Number(btn.dataset.p));
+  });
+  renderRecallLedger();
+}
+
+// 召回令：写明渠道（只对这一个渠道生效，其他渠道看同一份仍按放行的看）
+async function recallParagraph(p) {
+  const channel = prompt(`对哪个渠道召回第 ${p + 1} 段？\n\n下了令之后，这个渠道再看这份，这一段必须是空的、原文翻不出来；其他渠道不受影响。同一渠道对同一段只能召回一次，召回去不能再放亮。`, '');
+  if (channel === null) return;
+  const chan = channel.trim();
+  if (!chan) return;
+  try {
+    await api('POST', `/api/docs/${state.doc.id}/recalls`,
+      { channel: chan, paragraphs: [p], version: state.doc.version });
+    toast(`已对「${chan}」召回第 ${p + 1} 段`);
+    await reloadDoc();
+  } catch (e) {
+    if (e.status === 409) { toast(e.message); await reloadDoc(); }
+    else toast(e.message);
+  }
+}
+
+// 召回账：这份对哪个渠道召回过哪几段、有没有拒不召回（随回传只追加，不可抹）
+function renderRecallLedger() {
+  const host = $('#recallLedger');
+  const data = state.recalls || { orders: [], channels: [] };
+  if (!data.orders || !data.orders.length) { host.innerHTML = '<p class="hint">还没有下过召回令。</p>'; return; }
+  const byChan = new Map(data.channels.map(g => [g.channel, g]));
+  const chans = [...new Set(data.orders.map(o => o.channel))];
+  host.innerHTML = chans.map(ch => {
+    const g = byChan.get(ch) || { refusalCount: 0, refusalCallbacks: 0, refusals: [] };
+    const ps = [...new Set(data.orders.filter(o => o.channel === ch).flatMap(o => o.paragraphs))].sort((a, b) => a - b);
+    const bad = g.refusalCount > 0;
+    return `<div class="cb-sum ${bad ? 'bad' : 'ok'}">
+      <b>${esc(ch)}</b> · 召回第 ${ps.map(p => p + 1).join('、')} 段
+      <span class="badge ${bad ? 'orphaned' : 'accepted'}">拒不召回 ${g.refusalCallbacks || 0} 笔 / ${g.refusalCount || 0} 段</span>
+    </div>`;
+  }).join('');
 }
 
 async function releaseParagraph(p) {
@@ -651,11 +718,13 @@ function renderCallbackCard() {
   const sum = $('#callbackSummary');
   if (data.summary && data.summary.length) {
     sum.innerHTML = '<h3>分渠道账</h3>' + data.summary.map(s => {
-      const bad = s.leakCallbacks > 0 || s.missingCallbacks > 0;
+      const bad = s.leakCallbacks > 0 || s.missingCallbacks > 0 || s.refusalCallbacks > 0;
       return `<div class="cb-sum ${bad ? 'bad' : 'ok'}">
         <b>${esc(s.channel)}</b> · 回传 ${s.count} 次
+        <a href="#/ext/${state.doc.id}?channel=${encodeURIComponent(s.channel)}" class="open-ext">该渠道对外视图</a>
         <span class="badge ${s.leakCallbacks ? 'orphaned' : 'accepted'}">泄露 ${s.leakCallbacks}</span>
         <span class="badge ${s.missingCallbacks ? 'orphaned' : 'accepted'}">少发 ${s.missingCallbacks}</span>
+        <span class="badge ${s.refusalCallbacks ? 'rejected' : 'accepted'}">拒不召回 ${s.refusalCallbacks}</span>
         <span class="badge ${s.clean ? 'accepted' : 'rejected'}">干净 ${s.clean}</span>
       </div>`;
     }).join('');
@@ -663,24 +732,29 @@ function renderCallbackCard() {
     sum.innerHTML = '<p class="hint">还没有任何渠道回传。</p>';
   }
 
-  // 每笔账（最新在前）；旧的泄露/少发永远在
+  // 每笔账（最新在前）；旧的泄露/少发/拒不召回永远在
   const host = $('#callbackList');
   const items = (data.callbacks || []).slice().reverse();
   host.innerHTML = items.map(c => {
     const leak = c.leak.count > 0;
     const miss = c.missing.length > 0;
+    const refuse = (c.refusals || []).length > 0;
     const badge = c.clean
       ? '<span class="badge accepted">干净</span>'
-      : [leak ? '<span class="badge orphaned">泄露</span>' : '', miss ? '<span class="badge orphaned">少发</span>' : ''].join(' ');
+      : [leak ? '<span class="badge orphaned">泄露</span>' : '',
+         miss ? '<span class="badge orphaned">少发</span>' : '',
+         refuse ? '<span class="badge rejected">拒不召回</span>' : ''].join(' ');
     const detail = leak
       ? `<div class="hint">回传里有 ${c.leak.count} 处、${c.leak.chars} 字是外面看不见的（已记指纹，不显示/不落原字）。</div>` : '';
     const missDetail = miss
       ? `<div class="hint">少发第 ${c.missing.map(m => m.index + 1).join('、')} 段（共 ${c.missing.reduce((a, m) => a + m.len, 0)} 字）。</div>` : '';
+    const refuseDetail = refuse
+      ? `<div class="hint"><b>拒不召回：</b>仍带着已被召回的第 ${c.refusals.map(r => r.paragraph + 1).join('、')} 段（这笔账不可改，再回传也抹不掉）。</div>` : '';
     return `<div class="cb-item ${c.clean ? 'ok' : 'bad'}">
       <div class="meta">${badge}<b>${esc(c.channel)}</b>
         <span>第 ${c.seq} 次</span><span>${esc(c.by)} · ${fmtTime(c.at)}</span></div>
-      <div class="hint">回传 ${c.chars} 字 · 此刻外面 ${c.externalLen} 字</div>
-      ${detail}${missDetail}
+      <div class="hint">回传 ${c.chars} 字 · 该渠道此刻外面 ${c.externalLen} 字</div>
+      ${detail}${missDetail}${refuseDetail}
     </div>`;
   }).join('');
 }
@@ -701,9 +775,11 @@ $('#cbSubmit').onclick = async () => {
     } else {
       const frags = (r.leakFragments || []).map(s => s.replace(/\n/g, '⏎')).join(' / ').slice(0, 120);
       const miss = (r.missingParagraphs || []).length;
+      const refuse = (r.refusals || []).length;
       alert(`已记账（${channel} 第 ${c.seq} 次）：\n\n`
         + (c.leak.count ? `泄露 ${c.leak.count} 处、${c.leak.chars} 字（外面看不见的字），例如：\n${frags}\n\n` : '')
         + (miss ? `少发 ${miss} 整段。\n` : '')
+        + (refuse ? `拒不召回：仍带着第 ${r.refusals.map(x => x.paragraph + 1).join('、')} 段。\n` : '')
         + '这笔账不可修改，再回传一次也抹不掉。');
     }
     $('#cbContent').value = '';
@@ -825,12 +901,14 @@ const EVENT_TEXT = {
   'mask.synced': d => `随母稿确认遮罩，本稿同步遮罩 ${d.len} 字${d.count > 1 ? `（${d.count} 处）` : ''}（原文已抹除）`,
   'annotation.sealed': '一条批注因与遮罩重叠被永久封存',
   'paragraph.released': d => `作者放行第 ${(d.paragraph || 0) + 1} 段（外面只能看到放行时遮完后的字；不可收回）`,
+  'paragraph.recalled': d => `对渠道「${d.channel}」下达召回令：召回第 ${(d.paragraphs || []).join('、')} 段（共 ${d.count} 段；该渠道再看这些段为空）`,
   'release.scrubbed': d => `新增遮罩追加生效：已放行段对外快照再遮 ${d.len} 字（外面能读到的字只会更少）`,
   'callback.recorded': d => {
     if (d.clean) return `渠道「${d.channel}」第 ${d.seq} 次回传：与外面此刻能看见的字一致，干净`;
     const parts = [];
     if (d.leakCount > 0) parts.push(`泄露 ${d.leakCount} 处/${d.leakChars} 字`);
     if (d.missing > 0) parts.push(`少发 ${d.missing} 段`);
+    if (d.refusal > 0) parts.push(`拒不召回 ${d.refusal} 段`);
     return `渠道「${d.channel}」第 ${d.seq} 次回传：${parts.join('、')}（已记账，不可抹）`;
   },
   'review.closed': '审阅结束，对外稿冻结',
@@ -846,6 +924,8 @@ function renderEvents() {
 
 // ---------- 路由 ----------
 window.addEventListener('hashchange', () => {
+  const m = location.hash.match(/^#\/ext\/([^?]+)(?:\?channel=(.*))?$/);
+  if (m) return showExternal(decodeURIComponent(m[1]), m[2] ? decodeURIComponent(m[2]) : null);
   if (location.hash.startsWith('#/ext/')) showExternal(location.hash.slice(6));
 });
 

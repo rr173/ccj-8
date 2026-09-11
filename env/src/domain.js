@@ -75,7 +75,7 @@ class Service {
       const doc = {
         id, title, content, version: 1, status: 'open',
         createdAt: now, updatedAt: now, closedAt: null,
-        parentId: null, baseContent: null, baseVersion: null, releases: [],
+        parentId: null, baseContent: null, baseVersion: null, releases: [], recalls: [],
       };
       d.docs[id] = doc;
       d._ann = d._ann || {};
@@ -104,6 +104,7 @@ class Service {
         baseContent: parent.content,   // 三方合并基准：母稿当前正文
         baseVersion: parent.version,
         releases: [],                  // 投放稿的对外放行按段独立记录，不随派生复制
+        recalls: [],                   // 渠道召回令同样按份独立，不随派生复制
       };
       d.docs[newId] = doc;
       this._event(d, 'doc.derived', actor, parent.id, { child: newId, title: doc.title });
@@ -323,25 +324,158 @@ class Service {
     };
   }
 
+  // ---------- 渠道召回令（仅投放稿、仅作者；只追加、不可撤销/重复） ----------
+  // 作者对某一份投放稿、某一个渠道下召回令，点名“已经放行出去”的若干段。下了令之后：
+  //   - 这个渠道再看这份（external 带 channel），被点名的段必须是空的，原文翻不出来；
+  //     没被点名的渠道看同一份，还按原来放行的看（召回按渠道隔离，互不连坐）；
+  //   - 这个渠道再把发出去的字送回（registerCallback），若还带着被召回的段，
+  //     在这笔不可改的账上记一笔【拒不召回】，再送一次也抹不掉（账只追加）。
+  // 约束：
+  //   - 没放行过的段写不进召回令（点名段必须能解析到一条放行记录）；
+  //   - 同一渠道对同一段（同一条放行）只能召回一次；
+  //   - 召回不改正文、不动放行快照、也不把已经抹掉的字救回来——只是该渠道看不到。
+  async recallParagraphs(docId, channel, paragraphIndexes, actor, expectedVersion) {
+    if (actor !== 'author') throw httpError(403, '只有作者可以下渠道召回令');
+    const chan = normalizeChannel(channel);
+    if (!chan) throw httpError(400, '必须写明渠道');
+    if (!Array.isArray(paragraphIndexes) || !paragraphIndexes.length) {
+      throw httpError(400, '必须写明召回哪几段');
+    }
+    const idxs = [];
+    for (const p of paragraphIndexes) {
+      const n = Number(p);
+      if (!Number.isInteger(n) || n < 0) throw httpError(400, '段号错误');
+      if (!idxs.includes(n)) idxs.push(n);
+    }
+    return this.store.tx(d => {
+      const doc = d.docs[docId];
+      if (!doc) throw httpError(404, '文档不存在');
+      if (!doc.parentId) throw httpError(400, '召回令只对投放稿生效（母稿整篇对外，无按段放行口径）');
+      this._assertVersion(doc, expectedVersion);
+
+      const existing = new Set((doc.recalls || []).filter(o => o.channel === chan).flatMap(o => o.releaseIds));
+      const picked = [];
+      for (const idx of idxs) {
+        const hit = (doc.releases || []).filter(r => r.currentIndex === idx);
+        if (!hit.length) {
+          throw httpError(400, `第 ${idx + 1} 段没有放行记录，写不进召回令`);
+        }
+        if (hit.length > 1) {
+          throw httpError(409, `第 ${idx + 1} 段对应多条放行快照，请刷新后重试`);
+        }
+        const r = hit[0];
+        if (existing.has(r.id)) throw httpError(409, `渠道「${chan}」对第 ${idx + 1} 段已经召回过，不能重复召回`);
+        picked.push({ release: r, idx });
+      }
+
+      doc.recalls = doc.recalls || [];
+      d.counters.recall = (d.counters.recall || 0) + 1;
+      const id = 'rc_' + d.counters.recall;
+      const now = new Date().toISOString();
+      const order = {
+        id, docId, channel: chan,
+        releaseIds: picked.map(x => x.release.id),
+        paragraphs: picked.map(x => x.idx),
+        at: now, by: actor,
+      };
+      doc.recalls.push(order);
+      doc.version += 1;
+      doc.updatedAt = now;
+      this._event(d, 'paragraph.recalled', actor, docId, {
+        recall: id, channel: chan, paragraphs: order.paragraphs.map(i => i + 1), count: order.paragraphs.length,
+      });
+      return { doc: this._docView(d, doc), order: this._recallView(order) };
+    });
+  }
+
+  _recallView(o) {
+    return { id: o.id, channel: o.channel, paragraphs: o.paragraphs, count: o.paragraphs.length, by: o.by, at: o.at };
+  }
+
+  // 该渠道被点名召回的放行记录
+  _recalledReleases(doc, channel) {
+    const ids = new Set((doc.recalls || []).filter(o => o.channel === channel).flatMap(o => o.releaseIds));
+    return (doc.releases || []).filter(r => ids.has(r.id));
+  }
+
+  // 查这份对哪个渠道召回过哪几段、有没有拒不召回（读账计算；账只追加所以永不过期）。
+  // 可带 channel 只看某渠道。
+  async recallLedger(docId, channel) {
+    return this.store.read(d => {
+      const doc = d.docs[docId];
+      if (!doc) throw httpError(404, '文档不存在');
+      const chanFilter = channel ? normalizeChannel(channel) : null;
+      let orders = (doc.recalls || []).map(o => this._recallView(o));
+      if (chanFilter) orders = orders.filter(o => o.channel === chanFilter);
+
+      const cbs = (d.callbacks && d.callbacks[docId]) || [];
+      const byChannel = {};
+      for (const o of orders) {
+        const g = byChannel[o.channel] || (byChannel[o.channel] = {
+          channel: o.channel, recallCount: 0, recalledParagraphs: [],
+          refusalCallbacks: 0, refusals: [],
+        });
+        g.recallCount += o.count;
+        for (const p of o.paragraphs) if (!g.recalledParagraphs.includes(p)) g.recalledParagraphs.push(p);
+      }
+      // 拒不召回记在回传账上（只追加）：逐笔汇总进对应渠道
+      for (const c of cbs) {
+        if (chanFilter && c.channel !== chanFilter) continue;
+        if (!c.refusals || !c.refusals.length) continue;
+        const g = byChannel[c.channel] || (byChannel[c.channel] = {
+          channel: c.channel, recallCount: 0, recalledParagraphs: [],
+          refusalCallbacks: 0, refusals: [],
+        });
+        g.refusalCallbacks += 1;
+        for (const rf of c.refusals) {
+          g.refusals.push({ callback: c.id, seq: c.seq, paragraph: rf.paragraph, at: c.at });
+          if (!g.recalledParagraphs.includes(rf.paragraph)) g.recalledParagraphs.push(rf.paragraph);
+        }
+      }
+      for (const g of Object.values(byChannel)) {
+        g.recalledParagraphs.sort((a, b) => a - b);
+      }
+      return {
+        docId,
+        channel: chanFilter,
+        count: orders.length,
+        orders,
+        channels: Object.values(byChannel).map(g => ({
+          channel: g.channel,
+          recallOrders: orders.filter(o => o.channel === g.channel).length,
+          recalledParagraphs: g.recalledParagraphs,
+          refusalCallbacks: g.refusalCallbacks,
+          refusalCount: g.refusals.length,
+          refusals: g.refusals,
+        })),
+      };
+    });
+  }
+
   // 对外稿（免登录）：
   //  - 母稿：保持整篇可公开（所有已确认遮罩呈现为 █）；
   //  - 投放稿：按段放行制。没有放行任何段时，外面看到的是完全空白——
   //    连段数、篇幅、换行都不泄露；只有作者逐段“放行”的段才会出现在对外稿里。
   //    每段呈现的是“放行快照”：放行那一刻遮完后的字；放行后新增的遮罩
   //    （本稿确认或随母稿同步）按位置映射进快照继续抹除，只会更少不会更多。
-  async external(id) {
+  //  - 召回令按渠道生效：带 channel 时，作者已对该渠道点名召回的放行段从视图里
+  //    整段抽掉（该渠道这几段必须是空的）；没被点名的渠道（或不带 channel）
+  //    仍按原来放行的看。召回不抹快照原文，只是该渠道读不到。
+  async external(id, channel) {
     return this.store.read(d => {
       const doc = d.docs[id];
       if (!doc) throw httpError(404, '文档不存在');
+      const chan = channel ? normalizeChannel(channel) : null;
       if (!doc.parentId) {
-        return this._externalFull(doc);
+        return this._externalFull(doc, chan);
       }
-      return this._externalReleased(d, doc);
+      return this._externalReleased(d, doc, chan);
     });
   }
 
-  // 整篇对外（母稿）：剥离系统标记，遮罩块呈现为等长 █。
-  _externalFull(doc) {
+  // 整篇对外（母稿）：剥离系统标记，遮罩块呈现为等长 █。母稿没有按段放行/召回口径。
+  _externalFull(doc, channel) {
+    void channel;
     const chars = codePoints(doc.content);
     let out = '';
     const ranges = [];
@@ -362,8 +496,14 @@ class Service {
       released: null, closedAt: doc.closedAt };
   }
 
-  // 按段放行的对外稿（投放稿）。
-  _externalReleased(d, doc) {
+  // 按段放行的对外稿（投放稿）。channel 非空时按渠道召回令抽段：该渠道被点名
+  // 召回的放行段不进入拼接结果，于是“这个渠道再看这份，这几段必须是空的”；
+  // 没被点名的渠道与不带渠道的公开口径仍按原来放行的看。
+  // 返回里保留 parts（每段 {release,index,text}），回传对账要逐段判定在场与否。
+  _externalParts(d, doc, channel) {
+    const recalledIds = new Set((doc.recalls || [])
+      .filter(o => o.channel === channel)
+      .flatMap(o => o.releaseIds));
     const rels = (doc.releases || []).slice().sort((a, b) => {
       const ia = a.currentIndex, ib = b.currentIndex;
       if (ia !== null && ib !== null && ia !== ib) return ia - ib;
@@ -372,27 +512,43 @@ class Service {
       return a.createdAt < b.createdAt ? -1 : 1;
     });
     const parts = [];
-    const ranges = [];
     for (const r of rels) {
+      if (channel && recalledIds.has(r.id)) continue;
       const chars = codePoints(r.anchor);
-      let text = '', oi = 0, i = 0;
+      let text = '', i = 0;
       while (i < chars.length) {
         if (chars[i] === MARK) {
           let j = i + 1, n = 0;
           while (chars[j] === '█') { n++; j++; }
           if (chars[j] === MARK_END) {
-            ranges.push({ start: oi, end: oi + n, len: n });
             text += '█'.repeat(n);
-            oi += n; i = j + 1; continue;
+            i = j + 1; continue;
           }
         }
-        text += chars[i]; oi++; i++;
+        text += chars[i]; i++;
       }
-      parts.push(text);
+      parts.push({ release: r.id, index: r.paragraphIndex, text });
     }
-    // 未放行任何段：空字符串。段与段之间用换行连接，不补发被省略段的空行。
-    return { id: doc.id, title: doc.title, status: doc.status, content: parts.join('\n'),
-      masks: ranges, released: rels.length, closedAt: doc.closedAt };
+    return parts;
+  }
+
+  _externalReleased(d, doc, channel) {
+    const parts = this._externalParts(d, doc, channel || null);
+    // 各段用换行连接，不补发被省略/未放行/被召回段的空行；遮罩区间按拼接位置平移
+    const ranges = [];
+    const texts = [];
+    let base = 0;
+    for (const p of parts) {
+      for (const m of p.text.matchAll(/█+/g)) {
+        ranges.push({ start: base + m.index, end: base + m.index + m[0].length, len: m[0].length });
+      }
+      texts.push(p.text);
+      base += p.text.length + 1;
+    }
+    // 未放行任何段（或可见段都被该渠道召回）：空字符串，不泄露段数与篇幅
+    return { id: doc.id, title: doc.title, status: doc.status, content: texts.join('\n'),
+      masks: ranges, released: (doc.releases || []).length,
+      visible: parts.length, channel: channel || null, closedAt: doc.closedAt };
   }
 
   // ---------- 渠道回传记账（只追加、永不修改/抹除） ----------
@@ -418,14 +574,35 @@ class Service {
       if (!doc) throw httpError(404, '文档不存在');
       if (!doc.parentId) throw httpError(400, '渠道回传只对投放稿登记（母稿整篇对外，无按段放行口径）');
 
-      // “此刻外面能看见的字”——与免登录对外接口同一口径
-      const ext = doc.parentId ? this._externalReleased(d, doc) : this._externalFull(doc);
-      if (ext.content === '') {
+      // 全量对外口径（按召回前的放行）：只要整份外面还看得见字就收这笔回传；
+      // 某渠道把可见段全召回后，该渠道自己的视图为空——仍要收空回传（不能把
+      // “拒不召回”的账门也关上）。
+      const fullExt = this._externalReleased(d, doc, null);
+      if (fullExt.content === '') {
         throw httpError(409, '这一份还没有任何对外可见的字（未放行段落），不能收回传');
       }
 
       const received = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-      const verdict = this._reconcileCallback(ext.content, received);
+      // 该渠道此刻外面能看见的字：被点名召回的段对该渠道必须是空的。
+      const chanExt = this._externalReleased(d, doc, chan);
+      // 对账分两层，互不连坐：
+      //   1) 跟【该渠道视图】对 → 常规的干净 / 泄露 / 少发（没被点名召回的段照常）；
+      //   2) 跟【全量视图】对，只看“该渠道被召回的段”是否还被送回来 → 拒不召回。
+      const verdict = this._reconcileCallback(chanExt.content, received);
+      const fullVerdict = this._reconcileCallback(fullExt.content, received);
+
+      // 被点名召回的放行段：按全量视图里的段号取回在场判定；全 █ 段没有可见字
+      // 可作“原文还带着”的证据（本就读不到原文），不计拒不召回。
+      const recalledIdx = new Set((doc.recalls || [])
+        .filter(o => o.channel === chan)
+        .flatMap(o => o.paragraphs));
+      const refusals = [];
+      for (const idx of recalledIdx) {
+        const pres = fullVerdict.presence[idx];
+        if (pres && pres.visible > 0 && pres.visibleExact / pres.visible >= 0.5) {
+          refusals.push({ paragraph: idx, chars: pres.visible });
+        }
+      }
 
       d.callbacks = d.callbacks || {};
       d.callbacks[docId] = d.callbacks[docId] || [];
@@ -440,7 +617,7 @@ class Service {
         at: new Date().toISOString(),
         by: actor,
         chars: cpLen(received),
-        clean: verdict.clean,
+        clean: verdict.clean && refusals.length === 0,
         leak: {
           count: verdict.leaks.length,
           chars: verdict.leakChars,
@@ -448,26 +625,29 @@ class Service {
           items: verdict.leaks.map(f => ({ len: cpLen(f), sha256: sha256Hex(f) })),
         },
         missing: verdict.missing,
-        externalLen: cpLen(ext.content),
+        refusals,   // 拒不召回：只追加、不可改、再送一次也抹不掉（只存段号/字数）
+        externalLen: cpLen(chanExt.content),
       };
       d.callbacks[docId].push(record);
       this._event(d, 'callback.recorded', actor, docId, {
         callback: id, channel: chan, seq: record.seq,
         clean: record.clean, leakCount: record.leak.count, leakChars: record.leak.chars,
-        missing: record.missing.length,
+        missing: record.missing.length, refusal: refusals.length,
       });
       // 原始“泄露的字”只随本次响应返回，不进记录、不落盘
       return {
         callback: this._callbackView(record),
         leakFragments: verdict.clean ? [] : verdict.leaks,
         missingParagraphs: verdict.missing,
+        refusals,
       };
     });
   }
 
   // 拿“外面此刻能看见的字” externalText 对“渠道实际发出的字” received：
   // 用 code-point 级 diff（遮罩位置在对外稿里已是 █，与普通字一样逐字对）。
-  // 返回 { clean, leaks:[多出/对不上的片段], leakChars, missing:[整段没发的段] }。
+  // 返回 { clean, leaks:[多出/对不上的片段], leakChars, missing:[整段没发的段],
+  //         presence:{ 段号: {visible,visibleExact,masked,maskedFilled} } }。
   // 保守口径：顺序对不上（如整段调换）按“对不上 → 泄露”，不放过任何外面没有的字。
   // 少发只认“整段没发”：段里可见的字有一半以上被逐字照发（equal）才算同一段
   // 还在；把已遮代号按原文送回时，上下文可见字全部 equal、只有 █ 是 replace，于是
@@ -505,6 +685,7 @@ class Service {
     // 同时记泄露；什么都没发=整段少发）。
     const RATIO = 0.5;
     const missing = [];
+    const presence = {};
     let pStart = 0, pIdx = 0;
     for (let i = 0; i <= extChars.length; i++) {
       if (i !== extChars.length && extChars[i] !== '\n') continue;
@@ -520,6 +701,7 @@ class Service {
             if (cover[k] === 'eq') visibleExact++;
           }
         }
+        presence[pIdx] = { visible, visibleExact, masked, maskedFilled };
         const present = visible > 0
           ? visibleExact / visible >= RATIO
           : maskedFilled === masked;
@@ -529,7 +711,7 @@ class Service {
     }
 
     const clean = leakRanges.length === 0 && missing.length === 0;
-    return { clean, leaks, leakChars, missing };
+    return { clean, leaks, leakChars, missing, presence };
   }
 
   _callbackView(c) {
@@ -539,6 +721,7 @@ class Service {
       clean: c.clean,
       leak: { count: c.leak.count, chars: c.leak.chars, items: c.leak.items },
       missing: c.missing,
+      refusals: c.refusals || [],
     };
   }
 
@@ -561,10 +744,15 @@ class Service {
     const byChannel = {};
     for (const c of list) {
       const s = byChannel[c.channel] || (byChannel[c.channel] =
-        { channel: c.channel, count: 0, leakCallbacks: 0, missingCallbacks: 0, leakChars: 0, clean: 0 });
+        { channel: c.channel, count: 0, leakCallbacks: 0, missingCallbacks: 0,
+          refusalCallbacks: 0, refusalCount: 0, leakChars: 0, clean: 0 });
       s.count += 1;
       if (c.leak.count > 0) s.leakCallbacks += 1;
       if (c.missing.length > 0) s.missingCallbacks += 1;
+      if (c.refusals && c.refusals.length) {
+        s.refusalCallbacks += 1;
+        s.refusalCount += c.refusals.length;
+      }
       s.leakChars += c.leak.chars;
       if (c.clean) s.clean += 1;
     }
@@ -1089,6 +1277,7 @@ class Service {
       baseVersion: doc.baseVersion || null,
       paragraphs: paragraphBounds(doc.content).map(([start, end]) => ({ start, end })),
       releases: (doc.releases || []).map(r => this._releaseView(r)),
+      recalls: (doc.recalls || []).map(o => this._recallView(o)),
       callbacks: cbList.length,
       callbackSummary: doc.parentId ? this._callbackSummary(cbList.map(c => this._callbackView(c))) : [],
       parent: parent ? { id: parent.id, title: parent.title } : null,
