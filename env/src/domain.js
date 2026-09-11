@@ -586,10 +586,11 @@ class Service {
       if (a.start === null) continue;
       const m = mapRange(a.start, a.end, ops);
       if (a.kind === 'mask') {
-        // 遮罩点头是双人不可逆授权：作者改过这段字（选区内部有任何增/删/改），
-        // 点头立即作废——绝不能拿改之前的选区去遮现在的正文（否则会遮住审阅人
-        // 没看过的新字、或对错位置）。只有选区整体平移（编辑全在边界外、或仅
-        // 贴边界插入）才保留，并按 diff 移到新坐标。
+        // 遮罩点头是双人不可逆授权：作者改过这段字（选区内部有任何增/删/改，
+        // 或贴着选区边界加字——新字会挂在遮罩边上、旧选区遮不到它），点头立即
+        // 作废——绝不能拿改之前的选区去遮现在的正文（否则会遮住审阅人没看过的
+        // 新字、或对错位置）。只有编辑全在选区外（不贴边界）才保留，并按 diff
+        // 移到新坐标。
         if (m.status === 'orphaned' || !this._maskRangeUntouched(a.start, a.end, ops)) {
           a.start = null; a.end = null;
           a.status = 'void'; a.voidReason = 'content-changed';
@@ -610,14 +611,19 @@ class Service {
 
   // 遮罩选区 [start,end) 内部是否“一个字都没被动过”：
   //  - delete/replace 的旧文本跨度只要与选区相交（i2>start && i1<end）即被动过；
-  //  - insert 落在选区严格内部（start < i1 < end）也算动过——新字会被旧选区误遮；
-  //    恰好贴在 start/end 边界上的插入不影响选区覆盖的那串字，允许保留。
+  //  - insert 落在选区内部、或恰好贴在 start/end 边界上（start<=i1<=end）都算动过——
+  //    贴着边界加的字会直接挂在这串字边上，旧选区遮不到它：若放行，第二人按旧
+  //    范围点齐后，新字就挂在遮罩边上（前面被遮、后加的字漏在外面）；
+  //  - 贴着边界的 replace 若净增了字（新文本比旧文本长），等价于在字串边上
+  //    加字，同样算动过；纯删除、等长替换邻居字不算加字，点头随 diff 平移保留。
   _maskRangeUntouched(start, end, ops) {
-    for (const [tag, i1, i2] of ops) {
+    for (const [tag, i1, i2, j1, j2] of ops) {
       if (tag === 'equal') continue;
       if (tag === 'insert') {
-        if (i1 > start && i1 < end) return false;
+        if (i1 >= start && i1 <= end) return false;
       } else if (i2 > start && i1 < end) {
+        return false;
+      } else if (tag === 'replace' && (i2 === start || i1 === end) && (j2 - j1) > (i2 - i1)) {
         return false;
       }
     }

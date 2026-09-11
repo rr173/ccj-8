@@ -457,7 +457,7 @@ async function main() {
   const rawMulti = fs.readFileSync(path.join(tmp, 'data.json'), 'utf8');
   ok('落盘无 AAA/BBB/CCC', !rawMulti.includes('AAA') && !rawMulti.includes('BBB') && !rawMulti.includes('CCC'));
 
-  console.log('25) 双人确认制专项：一个人不算 / 边界插入保留 / 内部改动作废 / 普通批注仍可重新定位');
+  console.log('25) 双人确认制专项：一个人不算 / 贴边加字作废 / 内部改动作废 / 普通批注仍可重新定位');
   // (a) 一个人点头：对外仍能读到；作者账号无权点头
   const mD = await svc.createDoc('双人稿', '机密SIGMA勿外传，另有机密TAU也保密。', 'author');
   const d1 = await svc.getDoc(mD.id);
@@ -482,28 +482,42 @@ async function main() {
   // 点齐时与选区重叠的错误点头（sig..sig+4）也被作废清理
   ok('点齐后无残留待点头遮罩', !(await svc.annotations(mD.id)).some(a => a.kind === 'mask' && a.status === 'proposed'));
 
-  // (e) 一人点头后：作者在选区【边界】插入，点头保留；在选区【内部】改字，立即作废
+  // (e) 一人点头后：贴着选区边界加字（前/后）或选区内部改字 → 点头立即作废；
+  //     加过字再按旧范围去点不点齐，整串加过字的原文都还看得见
   const d2 = await svc.getDoc(mD.id);
   const tau = cpIndexOf(d2.content, 'TAU');
   await svc.maskNod(mD.id, tau, tau + 3, R1, d2.version);
-  // 边界（TAU 前面）插入：覆盖的仍是 TAU
-  const vEdge = (await svc.getDoc(mD.id)).version;
-  await svc.editContent(mD.id, d2.content.replace('另有机密TAU', '另有机密XTAU'), 'author', vEdge);
-  const afterEdge = (await svc.annotations(mD.id)).find(a => a.kind === 'mask' && a.status === 'proposed'
-    && a.covered === 'TAU' && a.approvers.includes(R1));
-  ok('选区边界插入：点头保留且仍覆盖 TAU', !!afterEdge);
-  // 内部改字（TAU 中插一个字）→ 点头作废，不能拿旧选区遮新正文
+  // 贴着选区前边界加字（TAU 前面插 X）→ 点头作废：新字会挂在遮罩边上，旧选区遮不到它
+  await svc.editContent(mD.id, d2.content.replace('另有机密TAU', '另有机密XTAU'), 'author', d2.version);
+  const afterEdge = (await svc.annotations(mD.id)).find(a => a.kind === 'mask' && a.author === R1);
+  ok('贴前边界加字：点头作废', afterEdge.status === 'void' && afterEdge.voidReason === 'content-changed'
+    && afterEdge.start === null);
+  ok('作废后整串原文仍读得到', (await svc.external(mD.id)).content.includes('XTAU'));
+  // 重新点头后，作者在这串字【后面】加了一个字 → 点头同样作废
   const d3 = await svc.getDoc(mD.id);
-  const vInside = d3.version;
-  await svc.editContent(mD.id, d3.content.replace('XTAU', 'XTXAU'), 'author', vInside);
-  const afterInside = (await svc.annotations(mD.id)).find(a => a.id === afterEdge.id);
+  const tau2 = cpIndexOf(d3.content, 'TAU');
+  const nod2 = await svc.maskNod(mD.id, tau2, tau2 + 3, R1, d3.version);
+  ok('作废后在当前正文重新点头', nod2.outcome === 'waiting');
+  await svc.editContent(mD.id, d3.content.replace('XTAU也', 'XTAU乙也'), 'author', d3.version);
+  const nod2After = (await svc.annotations(mD.id)).find(a => a.id === nod2.annotation.id);
+  ok('贴后边界加字：点头作废', nod2After.status === 'void' && nod2After.voidReason === 'content-changed'
+    && nod2After.start === null);
+  // 第二人仍按加字前的旧范围再划一次 → 不点齐、一个字都不遮
+  const d4 = await svc.getDoc(mD.id);
+  const n2old = await svc.maskNod(mD.id, tau2, tau2 + 3, R2, d4.version);
+  ok('加过字再按旧范围去划：不点齐、一个字不遮', n2old.outcome === 'waiting' && n2old.applied === false);
+  ok('整串加过字的原文仍都能看见', (await svc.external(mD.id)).content.includes('XTAU乙'));
+  // 内部改字（TAU 中插一个字）→ 第二人刚点的头也作废，不能拿旧选区遮新正文
+  const d5 = await svc.getDoc(mD.id);
+  await svc.editContent(mD.id, d5.content.replace('XTAU乙', 'XTXAU乙'), 'author', d5.version);
+  const afterInside = (await svc.annotations(mD.id)).find(a => a.id === n2old.annotation.id);
   ok('选区内部被改：点头作废', afterInside.status === 'void' && afterInside.voidReason === 'content-changed'
     && afterInside.start === null);
   ok('作废后对外仍读到新正文', (await svc.external(mD.id)).content.includes('TXAU'));
   // 作废后重新双人点头才能遮
-  const d4 = await svc.getDoc(mD.id);
-  const txau = cpIndexOf(d4.content, 'TXAU');
-  await nodBoth(mD.id, txau, txau + 4, d4.version);
+  const d6 = await svc.getDoc(mD.id);
+  const txau = cpIndexOf(d6.content, 'TXAU');
+  await nodBoth(mD.id, txau, txau + 4, d6.version);
   ok('重新双人点头后才抹掉', !(await svc.external(mD.id)).content.includes('TXAU'));
 
   // (f) 普通批注失位后仍可重新定位（遮罩不行）
