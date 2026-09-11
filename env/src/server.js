@@ -117,6 +117,15 @@ app.post('/api/docs/:id/close', requireAuth(['reviewer']), async (req, res, next
   catch (e) { next(e); }
 });
 
+// 按段放行（仅投放稿、仅作者）：放行后外面只能看到放行时遮完后的字；不可逆
+app.post('/api/docs/:id/release', requireAuth(['author']), async (req, res, next) => {
+  try {
+    const paragraph = Number(req.body && req.body.paragraph);
+    res.status(201).json(await service.releaseParagraph(
+      req.params.id, paragraph, req.user.name, req.body && req.body.version));
+  } catch (e) { next(e); }
+});
+
 // 对外稿：无需登录（审阅结束后对外发布的版本）
 app.get('/api/docs/:id/external', async (req, res, next) => {
   try { res.json(await service.external(req.params.id)); }

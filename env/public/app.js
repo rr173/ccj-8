@@ -98,6 +98,7 @@ async function loadDocs() {
       <td>${d.status === 'open' ? '<span class="tag open">审阅中</span>' : '<span class="tag closed">已冻结</span>'}</td>
       <td>v${d.version}</td>
       <td>${d.masks}</td>
+      <td>${d.parentId ? `${d.released || 0}/${d.paragraphs}` : '—'}</td>
       <td>${fmtTime(d.updatedAt)}</td>
       <td><button data-id="${d.id}" class="link open-doc">打开</button>
           ${state.me.role === 'author' ? `<button data-id="${d.id}" class="link derive-doc">派生</button>` : ''}
@@ -135,9 +136,15 @@ async function showExternal(id) {
     $('#extStatus').textContent = d.status === 'closed' ? '已冻结对外版' : '审阅中（内容可能继续变化）';
     $('#extStatus').className = 'tag ' + d.status;
     $('#extContent').innerHTML = renderExternalHtml(d.content);
+    if (!d.content) {
+      $('#extHint').textContent = d.released
+        ? ''
+        : '（这一份还没有放行任何段落：外面看不到任何内容。）';
+      return;
+    }
     $('#extHint').textContent = d.masks.length
       ? `共 ${d.masks.length} 段、${d.masks.reduce((a, m) => a + m.len, 0)} 字被遮罩，任何人无法读取。`
-      : '暂无遮罩。';
+      : '';
   } catch (e) {
     $('#extContent').textContent = '加载失败：' + e.message;
   }
@@ -223,6 +230,7 @@ function renderDoc(opts = {}) {
   renderContent();
   renderAnnotationList();
   renderMaskCard();
+  renderReleaseCard();
   renderEvents();
   const isAuthor = state.me.role === 'author';
   const frozen = doc.status !== 'open';
@@ -276,42 +284,53 @@ function renderContent() {
   const chars = Array.from(content);
   const segs = parseSegments(content);
   const highs = activeHighlights();
+  const releasedSet = state.doc.parentId ? releasedIndexSet() : new Set();
+  const bounds = state.doc.paragraphs || [];
 
-  for (const seg of segs) {
-    if (seg.kind === 'mask') {
-      const el = document.createElement('span');
-      el.className = 'mask-confirmed';
-      el.textContent = '█'.repeat(seg.len);
-      el.title = '已确认遮罩，原文已永久抹除';
-      host.appendChild(el);
-      continue;
-    }
-    // 每个字归属的批注 id（按优先级取一个类；id 存全部，点击取第一个）
-    let runStart = seg.start;
-    let runCls = null, runIds = null;
-    const flushRun = (end) => {
-      if (end <= runStart) return;
-      const el = document.createElement('span');
-      if (runCls) { el.className = 'ann ' + runCls; el.dataset.ann = runIds[0]; el.title = '点击查看批注'; }
-      el.textContent = chars.slice(runStart, end).join('');
-      host.appendChild(el);
-      runStart = end;
-    };
-    for (let p = seg.start; p < seg.end; p++) {
-      const covers = highs.filter(h => h.start <= p && p < h.end && h.kind !== 'mask');
-      const mask = highs.find(h => h.start <= p && p < h.end && h.kind === 'mask');
-      let cls = null, ids = null;
-      if (mask) { cls = 'mask-pending'; ids = [mask.id]; }
-      else if (covers.length) {
-        const c = covers[0];
-        cls = c.kind === 'suggest' ? 'suggest' : 'comment';
-        ids = covers.map(x => x.id);
+  for (let pi = 0; pi < bounds.length; pi++) {
+    const pEl = document.createElement('div');
+    pEl.className = 'para' + (releasedSet.has(pi) ? ' released' : '');
+    if (releasedSet.has(pi)) pEl.title = '该段已放行对外（只可见放行时遮完后的字）';
+    const pStart = bounds[pi].start, pEnd = bounds[pi].end;
+
+    for (const seg of segs.filter(s => s.start < pEnd && s.end > pStart)) {
+      const s0 = Math.max(seg.start, pStart), e0 = Math.min(seg.end, pEnd);
+      if (seg.kind === 'mask') {
+        const el = document.createElement('span');
+        el.className = 'mask-confirmed';
+        el.textContent = '█'.repeat(seg.len);
+        el.title = '已确认遮罩，原文已永久抹除';
+        pEl.appendChild(el);
+        continue;
       }
-      const key = cls === null ? '' : cls + '|' + ids.join(',');
-      const curKey = runCls === null ? '' : runCls + '|' + runIds.join(',');
-      if (key !== curKey) { flushRun(p); runCls = cls; runIds = ids ? [...ids] : null; }
+      // 每个字归属的批注 id（按优先级取一个类；id 存全部，点击取第一个）
+      let runStart = s0;
+      let runCls = null, runIds = null;
+      const flushRun = (end) => {
+        if (end <= runStart) return;
+        const el = document.createElement('span');
+        if (runCls) { el.className = 'ann ' + runCls; el.dataset.ann = runIds[0]; el.title = '点击查看批注'; }
+        el.textContent = chars.slice(runStart, end).join('');
+        pEl.appendChild(el);
+        runStart = end;
+      };
+      for (let p = s0; p < e0; p++) {
+        const covers = highs.filter(h => h.start <= p && p < h.end && h.kind !== 'mask');
+        const mask = highs.find(h => h.start <= p && p < h.end && h.kind === 'mask');
+        let cls = null, ids = null;
+        if (mask) { cls = 'mask-pending'; ids = [mask.id]; }
+        else if (covers.length) {
+          const c = covers[0];
+          cls = c.kind === 'suggest' ? 'suggest' : 'comment';
+          ids = covers.map(x => x.id);
+        }
+        const key = cls === null ? '' : cls + '|' + ids.join(',');
+        const curKey = runCls === null ? '' : runCls + '|' + runIds.join(',');
+        if (key !== curKey) { flushRun(p); runCls = cls; runIds = ids ? [...ids] : null; }
+      }
+      flushRun(e0);
     }
-    flushRun(seg.end);
+    host.appendChild(pEl);
   }
 
   host.onclick = e => {
@@ -328,8 +347,19 @@ function renderContent() {
 $('#contentRender').addEventListener('mouseup', () => setTimeout(handleSelection, 0));
 $('#contentRender').addEventListener('keyup', e => { if (e.key === 'Shift') setTimeout(handleSelection, 0); });
 
+// 某段 .para 在整篇 content 中的起始 code-point 偏移
+function paraOffset(paraEl) {
+  const host = $('#contentRender');
+  let off = 0;
+  let prev = paraEl.previousSibling;
+  while (prev) { off += cpLen(prev.textContent); prev = prev.previousSibling; }
+  void host;
+  return off;
+}
+
 function spanStart(span) {
-  let base = 0;
+  const para = span.closest('.para');
+  let base = para ? paraOffset(para) : 0;
   let prev = span.previousSibling;
   while (prev) {
     base += cpLen(prev.textContent);
@@ -347,6 +377,11 @@ function pointToContent(node, offset) {
   }
   if (node === host) {
     let p = 0;
+    for (let i = 0; i < offset && i < node.childNodes.length; i++) p += cpLen(node.childNodes[i].textContent);
+    return p;
+  }
+  if (node.classList && node.classList.contains('para')) {
+    let p = paraOffset(node);
     for (let i = 0; i < offset && i < node.childNodes.length; i++) p += cpLen(node.childNodes[i].textContent);
     return p;
   }
@@ -511,6 +546,50 @@ async function openAnnotation(id) {
   el?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
+// ---------- 按段放行（投放稿、作者） ----------
+function releasedIndexSet() {
+  return new Set((state.doc.releases || []).map(r => r.currentIndex).filter(i => i !== null));
+}
+function renderReleaseCard() {
+  const card = $('#releaseCard');
+  // 仅投放稿展示
+  if (!state.doc.parentId) { card.classList.add('hidden'); return; }
+  card.classList.remove('hidden');
+  const isAuthor = state.me.role === 'author';
+  const host = $('#releaseList');
+  const rels = state.doc.releases || [];
+  const done = releasedIndexSet();
+  const paras = (state.doc.paragraphs || []).map((b, i) => {
+    const text = cpSlice(state.doc.content, b.start, b.end);
+    const released = done.has(i);
+    const preview = text.replace(/⟦█+⟧/g, m => '█'.repeat(Math.max(1, (m.match(/█/g) || []).length)));
+    return `<div class="rel-item ${released ? 'done' : ''}">
+      <div class="meta"><span class="badge ${released ? 'accepted' : 'proposed'}">${released ? '已放行' : '未放行'}</span>
+        <span>第 ${i + 1} 段</span></div>
+      <div class="quote rel-quote">${esc(preview.slice(0, 60))}${preview.length > 60 ? '…' : ''}</div>
+      ${isAuthor && !released ? `<button class="primary act-release" data-p="${i}">放行此段（不可收回）</button>` : ''}
+    </div>`;
+  }).join('');
+  const orphaned = rels.filter(r => r.currentIndex === null).length;
+  host.innerHTML = paras
+    + (orphaned ? `<p class="hint">另有 ${orphaned} 段放行后正文改动较大、已失去当前段位置；对外快照仍保留且只会更严。</p>` : '');
+  host.querySelectorAll('.act-release').forEach(btn => {
+    btn.onclick = () => releaseParagraph(Number(btn.dataset.p));
+  });
+}
+
+async function releaseParagraph(p) {
+  if (!confirm(`确定放行第 ${p + 1} 段？\n\n放行后外面只能看到放行这一刻遮完后的字；放行不可收回、不可重复放行，之后新增的遮罩仍会继续遮住这段对应内容。`)) return;
+  try {
+    await api('POST', `/api/docs/${state.doc.id}/release`, { paragraph: p, version: state.doc.version });
+    toast(`第 ${p + 1} 段已放行`);
+    await reloadDoc();
+  } catch (e) {
+    if (e.status === 409) { toast(e.message); await reloadDoc(); }
+    else toast(e.message);
+  }
+}
+
 // ---------- 遮罩侧栏 ----------
 function renderMaskCard() {
   const host = $('#maskList');
@@ -607,6 +686,8 @@ const EVENT_TEXT = {
   'mask.confirmed': d => `确认不可逆遮罩 ${d.len} 字（原文已抹除，历史不保留被遮内容）`,
   'mask.synced': d => `随母稿确认遮罩，本稿同步遮罩 ${d.len} 字${d.count > 1 ? `（${d.count} 处）` : ''}（原文已抹除）`,
   'annotation.sealed': '一条批注因与遮罩重叠被永久封存',
+  'paragraph.released': d => `作者放行第 ${(d.paragraph || 0) + 1} 段（外面只能看到放行时遮完后的字；不可收回）`,
+  'release.scrubbed': d => `新增遮罩追加生效：已放行段对外快照再遮 ${d.len} 字（外面能读到的字只会更少）`,
   'review.closed': '审阅结束，对外稿冻结',
 };
 function kindName(k) { return k === 'mask' ? '遮罩提议' : k === 'suggest' ? '修改建议' : '批注'; }

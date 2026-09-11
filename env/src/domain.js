@@ -10,7 +10,7 @@
 const {
   codePoints, contentOpcodes, mapRange, mapRangeLoose, maskBlock, extractMasks,
   validateAuthorEdit, cpLen, MARK, MARK_END, hashPassword, randomToken,
-  mergeParagraphs,
+  mergeParagraphs, paragraphBounds,
 } = require('./util');
 
 class Service {
@@ -50,6 +50,8 @@ class Service {
       id: doc.id, title: doc.title, status: doc.status, version: doc.version,
       updatedAt: doc.updatedAt, masks: extractMasks(doc.content).length,
       parentId: doc.parentId || null,
+      released: (doc.releases || []).length,
+      paragraphs: paragraphBounds(doc.content).length,
       derived: Object.values(d.docs).filter(x => x.parentId === doc.id).length,
     })));
   }
@@ -65,7 +67,7 @@ class Service {
       const doc = {
         id, title, content, version: 1, status: 'open',
         createdAt: now, updatedAt: now, closedAt: null,
-        parentId: null, baseContent: null, baseVersion: null,
+        parentId: null, baseContent: null, baseVersion: null, releases: [],
       };
       d.docs[id] = doc;
       d._ann = d._ann || {};
@@ -93,6 +95,7 @@ class Service {
         parentId: parent.id,
         baseContent: parent.content,   // 三方合并基准：母稿当前正文
         baseVersion: parent.version,
+        releases: [],                  // 投放稿的对外放行按段独立记录，不随派生复制
       };
       d.docs[newId] = doc;
       this._event(d, 'doc.derived', actor, parent.id, { child: newId, title: doc.title });
@@ -117,10 +120,220 @@ class Service {
     });
   }
 
-  // 对外稿：剥离系统标记，只返回可公开文本；另附遮罩段位置
+  // ---------- 按段放行（仅投放稿、仅作者） ----------
+  // 放行 = 把“当前这一段遮完后的字”拍成对外快照。没放行的段不会出现在对外稿里，
+  // 服务端不会把它的原文发给任何人。放行只增不删：没有收回接口，同一段不能重复放行，
+  // 外部能看到的字从此只会因新增遮罩而变少。
+  async releaseParagraph(id, paragraphIndex, actor, expectedVersion) {
+    if (actor !== 'author') throw httpError(403, '只有作者可以放行段落');
+    if (!Number.isInteger(paragraphIndex) || paragraphIndex < 0) throw httpError(400, '段号错误');
+    return this.store.tx(d => {
+      const doc = d.docs[id];
+      if (!doc) throw httpError(404, '文档不存在');
+      if (!doc.parentId) throw httpError(400, '母稿整篇可公开；按段放行只适用于投放稿');
+      this._assertVersion(doc, expectedVersion);
+      const bounds = paragraphBounds(doc.content);
+      if (paragraphIndex >= bounds.length) throw httpError(400, '段号超出范围');
+      const [start, end] = bounds[paragraphIndex];
+      // 同一段只能放行一次（位置重叠即拒绝；已经放行过的段不会再被点亮或刷新）
+      for (const r of (doc.releases || [])) {
+        if (r.start !== null && start < r.end && end > r.start) {
+          throw httpError(409, '该段已经放行，不能重复放行或收回');
+        }
+      }
+      doc.releases = doc.releases || [];
+      d.counters.release = (d.counters.release || 0) + 1;
+      const rid = 'rel_' + d.counters.release;
+      const release = {
+        id: rid,
+        paragraphIndex,
+        // 放行段在“放行时正文”中的段内坐标：baseStart/baseEnd（自放行起不变）；
+        // releaseBase = 放行那一刻的整篇正文，只用于把后来的遮罩位置映射回放行时刻。
+        // start/end/currentIndex 是该段在“当前正文”里的现位置（普通改文严格跟随）。
+        baseStart: start, baseEnd: end,
+        releaseBase: doc.content,
+        start, end, currentIndex: paragraphIndex,
+        anchor: codePoints(doc.content).slice(start, end).join(''),
+        releasedBy: actor, releasedAt: new Date().toISOString(),
+        createdAt: new Date().toISOString(),
+      };
+      doc.releases.push(release);
+      doc.version += 1;
+      doc.updatedAt = new Date().toISOString();
+      this._event(d, 'paragraph.released', actor, id, { release: rid, paragraph: paragraphIndex });
+      return { doc: this._docView(d, doc), release: this._releaseView(release) };
+    });
+  }
+
+  // 正文改动后重定位所有放行段（改原文 / 接受建议 / 段三方合并同步共用）。
+  // 普通文字编辑走严格映射（宁丢不错位）：改动冲出该段就标记失去现位置（不再随
+  // 当前段号排序，但快照本身不动、对外仍只少不多）。
+  _remapReleases(doc, oldText, newText, loose) {
+    if (!doc.releases || !doc.releases.length) return;
+    const ops = contentOpcodes(oldText, newText);
+    for (const r of doc.releases) {
+      if (r.start === null) continue;
+      const m = loose ? mapRangeLoose(r.start, r.end, ops) : mapRange(r.start, r.end, ops);
+      if (!m || m.status === 'orphaned') {
+        r.currentIndex = null;
+      } else {
+        r.start = m.start; r.end = m.end;
+        r.currentIndex = this._indexOfOffset(newText, m.start);
+      }
+    }
+  }
+
+  // 某段新增遮罩后，把对应位置从该份所有放行记录里一并抹除（同一事务内完成，
+  // 事件只记字数）。每次遮罩要抹三处，保证被遮的字在落盘文件里也无处可寻：
+  //   1) doc.content（由调用方 _maskRangeInDoc / confirmMasks 完成）；
+  //   2) 每条放行的对外快照 anchor（外面能看到的字）；
+  //   3) 每条放行保存的“放行时整篇正文”releaseBase（位置映射用，也不能留原文）。
+  // 两层宽松映射保证改过的段也逃不掉：
+  //   遮罩前正文坐标 → releaseBase 坐标 → 裁进该放行段 [baseStart,baseEnd) →
+  //   段内快照坐标。宽松映射贴删改块边界，裁切保证只遮对应这一处、不连坐他段。
+  // 多区间的坐标漂移这样消除：先在 releaseBase 副本上从后往前一次性擦完所有命中
+  // 区间，再用 old→new 的 diff 重定位段边界；段内 anchor 同理按最终坐标从后往前擦。
+  // 本方法必须在 doc.content 已被改写成遮后形态之后调用。
+  _scrubReleases(d, doc, oldContent, ranges, actor, sourceId) {
+    if (!doc.releases || !doc.releases.length) return;
+    const curOps = contentOpcodes(oldContent, doc.content);
+    for (const r of doc.releases) {
+      // 命中区间换算到 releaseBase 坐标（区间彼此不重叠或被宽松映射吸附，从后往前处理）
+      const baseOps = contentOpcodes(oldContent, r.releaseBase);
+      const hits = [];
+      for (const range of ranges) {
+        const m = mapRangeLoose(range.start, range.end, baseOps);
+        if (m && m.end > m.start) hits.push(m);
+      }
+
+      if (hits.length) {
+        // ③ releaseBase 整篇物理抹除：从后往前，每个区间只基于“当前最新文本”擦一次
+        for (const h of hits.sort((a, b) => b.start - a.start)) {
+          r.releaseBase = this._eraseTextRanges(r.releaseBase, [h]);
+        }
+        // 段在新 releaseBase 中的边界：用 old→新 的最终 diff 一次定位（避免手算偏移）
+        const fin = mapRangeLoose(r.baseStart, r.baseEnd, contentOpcodes(oldContent, r.releaseBase));
+        const [newBaseStart, newBaseEnd] = fin
+          ? [fin.start, Math.max(fin.end, fin.start)]
+          : [r.baseStart, r.baseEnd];
+
+        // ② 对外快照：把命中区间裁进段内，换算成段内坐标后一次性从后往前擦
+        const localHits = hits
+          .map(h => [Math.max(h.start, r.baseStart) - r.baseStart, Math.min(h.end, r.baseEnd) - r.baseStart])
+          .filter(([s, e]) => e > s && s >= 0)
+          .sort((a, b) => b[0] - a[0]);
+        const erased = this._eraseAnchorRanges(r, localHits);
+
+        r.baseStart = newBaseStart;
+        r.baseEnd = newBaseEnd;
+        if (erased > 0) {
+          this._event(d, 'release.scrubbed', actor, doc.id, { release: r.id, len: erased, source: sourceId || null });
+        }
+      }
+
+      // ① 该段在“当前正文”里的现位置按遮罩宽松跟随（段内被遮也不丢排序位置）
+      const cur = mapRangeLoose(r.start, r.end, curOps);
+      if (cur) {
+        r.start = cur.start; r.end = Math.max(cur.end, cur.start);
+        r.currentIndex = this._indexOfOffset(doc.content, cur.start);
+      } else {
+        r.currentIndex = null;
+      }
+    }
+  }
+
+  // 把文本上若干区间（坐标互不重叠或从后往前处理无妨；调用方已从后往前排序）
+  // 中非遮罩块的字符换成等长遮罩块，返回新文本。遮罩块是原子不可切。
+  _eraseTextRanges(text, ranges) {
+    let out = text;
+    for (const range of [...ranges].sort((a, b) => b.start - a.start)) {
+      const spans = [];
+      let cur = range.start;
+      for (const m of extractMasks(out)) {
+        if (m.end <= cur) continue;
+        if (m.start >= range.end) break;
+        if (m.start > cur) spans.push([cur, Math.min(m.start, range.end)]);
+        cur = Math.max(cur, m.end);
+      }
+      if (cur < range.end) spans.push([cur, range.end]);
+      for (let i = spans.length - 1; i >= 0; i--) {
+        const [a, b] = spans[i];
+        const chars = codePoints(out);
+        out = chars.slice(0, a).join('') + maskBlock(b - a) + chars.slice(b).join('');
+      }
+    }
+    return out;
+  }
+
+  // 在放行快照（单段内部坐标）上把若干区间中非遮罩块的字符抹成遮罩块。
+  // 区间按从后往前处理：擦靠后的区间不会改变靠前区间的坐标。块是原子，跳过。
+  // 返回抹掉的字数。
+  _eraseAnchorRanges(r, ranges) {
+    let erased = 0;
+    for (const [s, e] of ranges) {
+      if (e <= s) continue;
+      // 扣除已存在遮罩块覆盖的部分，得到真正要擦的普通字符 span
+      const spans = [];
+      let cur = s;
+      for (const m of extractMasks(r.anchor)) {
+        if (m.end <= cur) continue;
+        if (m.start >= e) break;
+        if (m.start > cur) spans.push([cur, Math.min(m.start, e)]);
+        cur = Math.max(cur, m.end);
+      }
+      if (cur < e) spans.push([cur, e]);
+      for (let i = spans.length - 1; i >= 0; i--) {
+        const [a, b] = spans[i];
+        const chars = codePoints(r.anchor);
+        r.anchor = chars.slice(0, a).join('') + maskBlock(b - a) + chars.slice(b).join('');
+        erased += b - a;
+      }
+    }
+    return erased;
+  }
+
+  // 单区间便捷封装
+  _eraseAnchorRange(r, s, e) {
+    return this._eraseAnchorRanges(r, [[s, e]]);
+  }
+
+  // code-point 偏移落在第几段（按换行计）
+  _indexOfOffset(text, offset) {
+    const chars = codePoints(text);
+    let idx = 0;
+    for (let i = 0; i < offset && i < chars.length; i++) if (chars[i] === '\n') idx++;
+    return idx;
+  }
+
+  _releaseView(r) {
+    return {
+      id: r.id, paragraph: r.paragraphIndex,
+      currentIndex: r.currentIndex,
+      start: r.start, end: r.end,
+      releasedBy: r.releasedBy, releasedAt: r.releasedAt,
+      masks: extractMasks(r.anchor).length,
+    };
+  }
+
+  // 对外稿（免登录）：
+  //  - 母稿：保持整篇可公开（所有已确认遮罩呈现为 █）；
+  //  - 投放稿：按段放行制。没有放行任何段时，外面看到的是完全空白——
+  //    连段数、篇幅、换行都不泄露；只有作者逐段“放行”的段才会出现在对外稿里。
+  //    每段呈现的是“放行快照”：放行那一刻遮完后的字；放行后新增的遮罩
+  //    （本稿确认或随母稿同步）按位置映射进快照继续抹除，只会更少不会更多。
   async external(id) {
-    const doc = await this.getDoc(id);
-    if (!doc) throw httpError(404, '文档不存在');
+    return this.store.read(d => {
+      const doc = d.docs[id];
+      if (!doc) throw httpError(404, '文档不存在');
+      if (!doc.parentId) {
+        return this._externalFull(doc);
+      }
+      return this._externalReleased(d, doc);
+    });
+  }
+
+  // 整篇对外（母稿）：剥离系统标记，遮罩块呈现为等长 █。
+  _externalFull(doc) {
     const chars = codePoints(doc.content);
     let out = '';
     const ranges = [];
@@ -137,7 +350,41 @@ class Service {
       }
       out += chars[i]; oi++; i++;
     }
-    return { id: doc.id, title: doc.title, status: doc.status, content: out, masks: ranges, closedAt: doc.closedAt };
+    return { id: doc.id, title: doc.title, status: doc.status, content: out, masks: ranges,
+      released: null, closedAt: doc.closedAt };
+  }
+
+  // 按段放行的对外稿（投放稿）。
+  _externalReleased(d, doc) {
+    const rels = (doc.releases || []).slice().sort((a, b) => {
+      const ia = a.currentIndex, ib = b.currentIndex;
+      if (ia !== null && ib !== null && ia !== ib) return ia - ib;
+      if (ia === null && ib !== null) return 1;   // 段已被改动、失去现位置的排在后
+      if (ib === null && ia !== null) return -1;
+      return a.createdAt < b.createdAt ? -1 : 1;
+    });
+    const parts = [];
+    const ranges = [];
+    for (const r of rels) {
+      const chars = codePoints(r.anchor);
+      let text = '', oi = 0, i = 0;
+      while (i < chars.length) {
+        if (chars[i] === MARK) {
+          let j = i + 1, n = 0;
+          while (chars[j] === '█') { n++; j++; }
+          if (chars[j] === MARK_END) {
+            ranges.push({ start: oi, end: oi + n, len: n });
+            text += '█'.repeat(n);
+            oi += n; i = j + 1; continue;
+          }
+        }
+        text += chars[i]; oi++; i++;
+      }
+      parts.push(text);
+    }
+    // 未放行任何段：空字符串。段与段之间用换行连接，不补发被省略段的空行。
+    return { id: doc.id, title: doc.title, status: doc.status, content: parts.join('\n'),
+      masks: ranges, released: rels.length, closedAt: doc.closedAt };
   }
 
   // ---------- 批注查询 ----------
@@ -281,9 +528,11 @@ class Service {
       }
 
       // suggest：把替换文写进正文，其他活动批注按 diff 跟随
+      const preEdit = doc.content;
       const chars = codePoints(doc.content);
       const next = chars.slice(0, a.start).join('') + a.replacement + chars.slice(a.end).join('');
       this._remapActive(d, doc, next, { skipAnnId: a.id });
+      this._remapReleases(doc, preEdit, next, false);
       doc.content = next;
       doc.version += 1;
       doc.updatedAt = new Date().toISOString();
@@ -307,7 +556,9 @@ class Service {
       this._assertVersion(doc, expectedVersion);
       const err = validateAuthorEdit(doc.content, content);
       if (err) throw httpError(400, err);
+      const preEdit = doc.content;
       this._remapActive(d, doc, content);
+      this._remapReleases(doc, preEdit, content, false);
       doc.content = content;
       doc.version += 1;
       doc.updatedAt = new Date().toISOString();
@@ -400,6 +651,9 @@ class Service {
       doc.content = content;
       doc.version += 1;
       doc.updatedAt = new Date().toISOString();
+      // 本稿自己确认的遮罩：从已放行段的对外快照里抹掉（外面只能更少），
+      // 并把被遮文字从放行记录保存的放行时刻正文中物理抹除（落盘不留原文）。
+      this._scrubReleases(d, doc, preMaskContent, maskedRanges, actor, null);
       // 母稿确认的遮罩：所有已派生的投放稿跟着把对应的那一处遮掉（只向下传播，绝不写回）
       this._propagateMasks(d, doc, preMaskContent, maskedRanges, actor);
       return { doc: this._docView(d, doc), sealed };
@@ -450,7 +704,9 @@ class Service {
       child.baseContent = parent.content;
       child.baseVersion = parent.version;
       if (merged === child.content) continue;
+      const childBefore = child.content;
       this._remapActive(d, child, merged);
+      this._remapReleases(child, childBefore, merged, false);
       child.content = merged;
       child.version += 1;
       child.updatedAt = new Date().toISOString();
@@ -481,6 +737,9 @@ class Service {
       for (const m of mapped.sort((a, b) => b.start - a.start)) {
         if (this._maskRangeInDoc(d, child, m.start, m.end, actor, parent.id)) changed = true;
       }
+      // 母稿新遮罩向下同步后，这份投放稿已放行的段也要在“放行那一刻”的快照上
+      // 把对应的那处抹掉——外面能读到的字只会更少，改过的段也按位置照遮。
+      this._scrubReleases(d, child, childOld, mapped, actor, parent.id);
       child.baseContent = parent.content;
       child.baseVersion = parent.version;
       if (changed) {
@@ -532,6 +791,8 @@ class Service {
       masks: extractMasks(doc.content),
       parentId: doc.parentId || null,
       baseVersion: doc.baseVersion || null,
+      paragraphs: paragraphBounds(doc.content).map(([start, end]) => ({ start, end })),
+      releases: (doc.releases || []).map(r => this._releaseView(r)),
       parent: parent ? { id: parent.id, title: parent.title } : null,
       derived: this._childrenOf(d, doc.id).map(x => ({ id: x.id, title: x.title, status: x.status })),
     };

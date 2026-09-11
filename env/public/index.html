@@ -43,7 +43,7 @@
     </div>
     <div class="card">
       <table id="docTable">
-        <thead><tr><th>标题</th><th>状态</th><th>版本</th><th>遮罩段</th><th>更新时间</th><th></th></tr></thead>
+        <thead><tr><th>标题</th><th>状态</th><th>版本</th><th>遮罩段</th><th>放行段</th><th>更新时间</th><th></th></tr></thead>
         <tbody></tbody>
       </table>
       <div id="newDoc" class="hidden">
@@ -113,6 +113,12 @@
           <p class="hint">确认前可预览对外效果；确认后被遮的字从正文和历史中永久抹除，作者和审阅人都无法再读到。</p>
           <div id="maskList"></div>
           <button id="previewMaskBtn" class="danger">预览遮罩后的对外稿</button>
+        </div>
+        <div class="card hidden" id="releaseCard">
+          <h3>按段放行（投放）</h3>
+          <p class="hint">没放行的段，外面打开这一份是<b>完全空白</b>，原文谁也读不到。放行后外面只能看到<b>放行那一刻遮完后的字</b>；
+            放行只增不删、不可收回，之后母稿或本稿新增的遮罩会继续追加生效。各投放稿各自独立放行。</p>
+          <div id="releaseList"></div>
         </div>
         <div class="card">
           <h3>历史</h3>

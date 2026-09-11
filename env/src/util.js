@@ -251,6 +251,22 @@ function validateAuthorEdit(oldText, newText) {
 
 function cpLen(s) { return codePoints(s).length; }
 
+// ---------- 段（按段放行用） ----------
+// 段以换行分隔；返回每段在 code-point 坐标上的 [start, end)（不含换行符本身）。
+// 遮罩块原子计入其占位长度，与正文坐标体系一致。
+function paragraphBounds(text) {
+  const chars = codePoints(text);
+  const bounds = [];
+  let start = 0;
+  for (let i = 0; i <= chars.length; i++) {
+    if (i === chars.length || chars[i] === '\n') {
+      bounds.push([start, i]);
+      start = i + 1;
+    }
+  }
+  return bounds;
+}
+
 // ---------- 母稿 → 投放稿：三方合并 ----------
 // base   = 投放稿记录的母稿正文（上次同步时）；master = 母稿当前正文；child = 投放稿当前正文。
 // 先按“段”（换行分隔）对齐：
@@ -370,6 +386,6 @@ function randomToken() { return crypto.randomBytes(24).toString('hex'); }
 module.exports = {
   codePoints, diffOpcodes, mapRange, mapRangeLoose, contentOpcodes,
   MARK, MARK_END, maskBlock, extractMasks, tokenize, validateAuthorEdit, cpLen,
-  mergeParagraphs, mergeTokens,
+  mergeParagraphs, mergeTokens, paragraphBounds,
   hashPassword, verifyPassword, sign, unsign, randomToken,
 };

@@ -224,11 +224,18 @@ async function main() {
   await svc.editContent(k2.id, '【置顶】' + k2Doc.content, 'author', k2Doc.version);
   const followed = (await svc.annotations(k2.id)).find(a => a.id === followAnn.id);
   ok('改某一份时该份批注跟着位置走', followed.status === 'proposed' && followed.covered === '公开文字乙');
-  // 对外看某一份只能看到那一份遮完后的字
+  // 对外看某一份只能看到那一份遮完后的字（先逐段放行；没放行的段外面没有）
+  const k1View = await svc.getDoc(k1.id);
+  for (let p = 0; p < k1View.paragraphs.length; p++) {
+    await svc.releaseParagraph(k1.id, p, 'author', (await svc.getDoc(k1.id)).version);
+  }
+  const k2View = await svc.getDoc(k2.id);
+  await svc.releaseParagraph(k2.id, 0, 'author', k2View.version); // k2 只放第一段
   const ext1 = await svc.external(k1.id);
   ok('k1 对外稿无 k1 已遮文字', !ext1.content.includes('乙改') && !ext1.content.includes('九千万元') && ext1.content.includes('██'));
   const ext2 = await svc.external(k2.id);
   ok('k2 对外稿是 k2 自己的字', ext2.content.includes('公开文字乙') && !ext2.content.includes('乙改'));
+  ok('k2 只放行第一段：后面的段外面读不到', !ext2.content.includes('联系方式'));
 
   console.log('17) 已冻结的投放稿：文字不再同步，遮罩仍强制同步');
   await svc.closeDoc(k2.id, 'reviewer');
@@ -288,6 +295,7 @@ async function main() {
   const kBAfter = await svc.getDoc(kB.id);
   ok('投放稿改写过的代号也被遮掉', !kBAfter.content.includes('德塔九号') && kBAfter.content.includes('⟦████⟧'));
   ok('遮罩只盖代号、上下文不动', kBAfter.content === '兹有内部代号⟦████⟧，请勿外传。');
+  await svc.releaseParagraph(kB.id, 0, 'author', (await svc.getDoc(kB.id)).version);
   const kBExt = await svc.external(kB.id);
   ok('对外读不到改过的代号', !kBExt.content.includes('德塔九号') && kBExt.content.includes('████'));
   const rawB = fs.readFileSync(path.join(tmp, 'data.json'), 'utf8');
@@ -303,8 +311,125 @@ async function main() {
   const kCAfter = await svc.getDoc(kC.id);
   ok('对应的那一处被遮掉', kCAfter.content.includes('代号⟦█████⟧开头'));
   ok('结尾相同的字不被连坐', kCAfter.content.includes('结尾又是ALPHA。'));
+  await svc.releaseParagraph(kC.id, 0, 'author', (await svc.getDoc(kC.id)).version);
   const kCExt = await svc.external(kC.id);
   ok('对外稿也只遮那一处', kCExt.content.includes('代号█████开头') && kCExt.content.includes('结尾又是ALPHA。'));
+
+  console.log('22) 按段放行：不亮则空、按段独立、只看放行时遮后字、后续遮罩追加、不可收回');
+  const pText = '首段：公开内容甲。\n二段：代号NOVA八，先放行。\n三段：内部底价九千万。';
+  const pm = await svc.createDoc('放行母稿', pText, 'author');
+  const pa = await svc.deriveDoc(pm.id, '投放稿甲', 'author');
+  const pb = await svc.deriveDoc(pm.id, '投放稿乙', 'author');
+
+  // (a) 没放行任何段：外面整份是空的——连段数、篇幅、换行都没有
+  const emptyA = await svc.external(pa.id);
+  ok('未放行：对外稿为空字符串', emptyA.content === '' && emptyA.released === 0);
+  const emptyB = await svc.external(pb.id);
+  ok('另一份同样为空', emptyB.content === '');
+  ok('未放行段原文不在对外响应里', JSON.stringify(emptyA).indexOf('NOVA') < 0 && JSON.stringify(emptyA).indexOf('九千万') < 0);
+
+  // (b) 权限：只有作者能放行；母稿没有按段放行
+  const errReviewer = await svc.releaseParagraph(pa.id, 0, 'reviewer', 1).then(() => null, e => e);
+  ok('审阅人不能放行', errReviewer && errReviewer.status === 403);
+  const errMaster = await svc.releaseParagraph(pm.id, 0, 'author', 1).then(() => null, e => e);
+  ok('母稿不支持按段放行', errMaster && errMaster.status === 400);
+
+  // (c) 甲只放第二段；外面只有放行时遮完后的字，没有别的段
+  await svc.releaseParagraph(pa.id, 1, 'author', 1);
+  let extA = await svc.external(pa.id);
+  ok('只放第二段：外面只见这一段', extA.content === '二段：代号NOVA八，先放行。');
+  ok('外面没有第一/三段', !extA.content.includes('公开内容甲') && !extA.content.includes('九千万'));
+  // 乙一份没放，不能被甲带着亮
+  ok('两份投放稿各放各的：乙仍为空', (await svc.external(pb.id)).content === '');
+
+  // (d) 放行后内部改正文（第二段、第三段），外面不变
+  const paDoc = await svc.getDoc(pa.id);
+  await svc.editContent(pa.id,
+    paDoc.content.replace('先放行', '先放行（内部修订）').replace('九千万', '九千万整'),
+    'author', paDoc.version);
+  extA = await svc.external(pa.id);
+  ok('放行后内部改文不外流', extA.content === '二段：代号NOVA八，先放行。');
+
+  // (e) 放行后母稿确认新遮罩，已放行那段对应那处也跟着遮；其他相同字不连坐
+  const pmDoc = await svc.getDoc(pm.id);
+  const nPos = cpIndexOf(pmDoc.content, 'NOVA');
+  await svc.addAnnotation({ docId: pm.id, kind: 'mask', start: nPos, end: nPos + 4, note: '' }, 'reviewer', pmDoc.version);
+  await svc.confirmMasks(pm.id, null, 'reviewer', pmDoc.version);
+  extA = await svc.external(pa.id);
+  ok('母稿新遮罩追加到已放行段', !extA.content.includes('NOVA') && extA.content.includes('████'));
+  ok('追加遮罩只遮对应那处，上下文不动', extA.content === '二段：代号████八，先放行。');
+  ok('乙没放行 → 外面读不到任何字（包括被遮段）', (await svc.external(pb.id)).content === '');
+
+  // (f) 已经放行的段不能收回，也不能重复放行刷新
+  const paDoc2 = await svc.getDoc(pa.id);
+  const relIdx = paDoc2.releases[0].currentIndex; // 母稿遮罩后段落位置跟随
+  const errAgain = await svc.releaseParagraph(pa.id, relIdx, 'author', paDoc2.version).then(() => null, e => e);
+  ok('同段重复放行被拒', errAgain && errAgain.status === 409);
+  const errBadPara = await svc.releaseParagraph(pa.id, 99, 'author', paDoc2.version).then(() => null, e => e);
+  ok('段号越界被拒', errBadPara && errBadPara.status === 400);
+
+  // (g) 乙放行第一段：甲没有的段不会在乙出现，乙也不会因此亮甲的段
+  await svc.releaseParagraph(pb.id, 0, 'author', (await svc.getDoc(pb.id)).version);
+  const extB = await svc.external(pb.id);
+  ok('乙只亮乙放的段', extB.content.includes('公开内容甲') && !extB.content.includes('九千万'));
+  ok('甲的对外稿不受乙放行影响', (await svc.external(pa.id)).content === extA.content);
+
+  // (h) 投放稿自己确认的遮罩也追加进放行快照
+  let pbDoc = await svc.getDoc(pb.id);
+  const jPos = cpIndexOf(pbDoc.content, '公开');
+  await svc.addAnnotation({ docId: pb.id, kind: 'mask', start: jPos, end: jPos + 2, note: '' }, 'reviewer', pbDoc.version);
+  pbDoc = await svc.getDoc(pb.id);
+  await svc.confirmMasks(pb.id, null, 'reviewer', pbDoc.version);
+  const extB2 = await svc.external(pb.id);
+  ok('本稿确认遮罩也遮掉已放行段', !extB2.content.includes('公开') && extB2.content.includes('██'));
+  ok('本稿遮罩不写回母稿', (await svc.getDoc(pm.id)).content.includes('公开内容甲'));
+
+  // (i) 逐段放行后多段按当前段序拼接；被内部改过的未放行段不放行就不亮
+  const paDoc3 = await svc.getDoc(pa.id);
+  await svc.releaseParagraph(pa.id, 0, 'author', paDoc3.version); // 第一段
+  // 第三段已被内部修订过（九千万整），仍可放行；放行看到的是放行时刻遮后的字
+  const paDoc4 = await svc.getDoc(pa.id);
+  const thirdIdx = paDoc4.paragraphs.length - 1;
+  await svc.releaseParagraph(pa.id, thirdIdx, 'author', paDoc4.version);
+  const extA3 = await svc.external(pa.id);
+  const lines = extA3.content.split('\n');
+  ok('三段都放行后按段序呈现', lines.length === 3 && lines[0].includes('公开内容甲')
+    && lines[1].includes('代号████') && lines[2].includes('九千万整'));
+
+  // (j) 落盘文件里：未放行段的原文在数据文件中仍在（内部要能改），
+  //     但已被遮的字在正文与所有放行记录里都搜不到
+  const raw3 = fs.readFileSync(path.join(tmp, 'data.json'), 'utf8');
+  ok('落盘无已遮字 NOVA（含放行记录）', !raw3.includes('NOVA'));
+  ok('未放行但未遮的内部字仍留在服务端数据里', raw3.includes('九千万整'));
+  const relEvents = await svc.events(pa.id);
+  ok('历史有放行/追加遮罩事件且不含被遮字',
+    relEvents.some(e => e.type === 'paragraph.released')
+    && relEvents.some(e => e.type === 'release.scrubbed')
+    && !JSON.stringify(relEvents).includes('NOVA'));
+
+  console.log('23) 放行快照不被“放开遮罩”类操作复活：外部可见字单调不增');
+  // 母稿没有删除遮罩块的能力（validateAuthorEdit 拒绝）；再验证一次放行段上的块不可删
+  const paNow = await svc.getDoc(pa.id);
+  const errDelBlock = await svc.editContent(pa.id, paNow.content.replace('⟦████⟧', ''), 'author', paNow.version)
+    .then(() => null, e => e);
+  ok('放行段内遮罩块同样不可删除', errDelBlock && errDelBlock.status === 400);
+  const extStable = await svc.external(pa.id);
+  ok('外面读到的仍是遮后版本', !extStable.content.includes('NOVA') && extStable.content.includes('████'));
+
+  console.log('24) 同一次确认里多个遮罩命中同一放行段：快照逐处抹对、不漂移');
+  const mMulti = await svc.createDoc('多遮母稿', '代号AAA无关代号BBB无关代号CCC。', 'author');
+  const kMulti = await svc.deriveDoc(mMulti.id, '多遮投放稿', 'author');
+  await svc.releaseParagraph(kMulti.id, 0, 'author', 1);
+  const mmDoc = await svc.getDoc(mMulti.id);
+  for (const token of ['AAA', 'BBB', 'CCC']) {
+    const pp = cpIndexOf(mmDoc.content, token);
+    await svc.addAnnotation({ docId: mMulti.id, kind: 'mask', start: pp, end: pp + 3, note: '' }, 'reviewer', mmDoc.version);
+  }
+  await svc.confirmMasks(mMulti.id, null, 'reviewer', mmDoc.version);
+  const extMulti = await svc.external(kMulti.id);
+  ok('三处都抹对、上下文不动', extMulti.content === '代号███无关代号███无关代号███。');
+  const rawMulti = fs.readFileSync(path.join(tmp, 'data.json'), 'utf8');
+  ok('落盘无 AAA/BBB/CCC', !rawMulti.includes('AAA') && !rawMulti.includes('BBB') && !rawMulti.includes('CCC'));
 
   console.log(`\n全部通过：${passed} 项断言`);
 }

@@ -174,10 +174,9 @@ async function waitReady() {
     const kCur2 = (await req('reviewer', 'GET', `/api/docs/${kid}`)).body;
     ok('投放稿跟着遮掉同一段', !kCur2.content.includes('三段更新') && kCur2.content.includes('⟦████⟧'));
 
-    // 对外看投放稿只能看到它遮完后的字（免登录）
-    const kExt = (await req(null, 'GET', `/api/docs/${kid}/external`)).body;
-    ok('投放稿对外稿只有遮完的字',
-      !kExt.content.includes('TOPSECRET9') && !kExt.content.includes('三段更新') && kExt.content.includes('████'));
+    // 投放稿对外稿：未逐段放行时完全为空（免登录也拿不到任何字）
+    const kEmpty = (await req(null, 'GET', `/api/docs/${kid}/external`)).body;
+    ok('未放行：投放稿对外稿为空', kEmpty.content === '' && kEmpty.released === 0);
 
     // 投放稿自己确认遮罩，不写回母稿
     const kCur3 = (await req('reviewer', 'GET', `/api/docs/${kid}`)).body;
@@ -187,6 +186,44 @@ async function waitReady() {
     vv = (await req('reviewer', 'GET', `/api/docs/${kid}`)).body.version;
     await req('reviewer', 'POST', `/api/docs/${kid}/masks/confirm`, { version: vv });
     ok('投放稿遮罩不写回母稿', (await req('reviewer', 'GET', `/api/docs/${mid}`)).body.content.includes('首段公开'));
+
+    // 按段放行：只有作者能放；逐段放行后外面只看到遮完后的字；不可重复放行
+    ok('审阅人不能放行', (await req('reviewer', 'POST', `/api/docs/${kid}/release`, { paragraph: 0 })).status === 403);
+    ok('母稿不支持按段放行', (await req('author', 'POST', `/api/docs/${mid}/release`, { paragraph: 0 })).status === 400);
+    const kReady = (await req('author', 'GET', `/api/docs/${kid}`)).body;
+    const paraCount = kReady.paragraphs.length;
+    for (let p = 0; p < paraCount; p++) {
+      const cur = (await req('author', 'GET', `/api/docs/${kid}`)).body;
+      const r = await req('author', 'POST', `/api/docs/${kid}/release`, { paragraph: p, version: cur.version });
+      ok(`第 ${p + 1} 段放行 201`, r.status === 201);
+    }
+    const dupRel = await req('author', 'POST', `/api/docs/${kid}/release`,
+      { paragraph: 0, version: (await req('author', 'GET', `/api/docs/${kid}`)).body.version });
+    ok('重复放行被拒（不可收回/刷新）', dupRel.status === 409);
+    const kExt = (await req(null, 'GET', `/api/docs/${kid}/external`)).body;
+    ok('放行后对外稿只有遮完的字',
+      !kExt.content.includes('TOPSECRET9') && !kExt.content.includes('三段更新')
+      && !kExt.content.includes('首段公开') && kExt.content.includes('████'));
+    ok('对外稿带放行段数', kExt.released === paraCount);
+
+    // 两份投放稿各放各的：另一份没放行，外面必须为空
+    const kid2 = (await req('author', 'POST', `/api/docs/${mid}/derive`, { title: '投放稿B' })).body.id;
+    ok('另一份未放行对外为空', (await req(null, 'GET', `/api/docs/${kid2}/external`)).body.content === '');
+    // 母稿仍整篇对外（按段放行只作用于投放稿）
+    const masterExt = (await req(null, 'GET', `/api/docs/${mid}/external`)).body;
+    ok('母稿仍整篇对外', masterExt.content.includes('首段公开') && masterExt.released === null);
+
+    // 放行后母稿再确认遮罩：已放行段对应那处外面也读不到
+    const mNow = (await req('reviewer', 'GET', `/api/docs/${mid}`)).body;
+    const tailPos = cpIndexOf(mNow.content, '尾'); // “二段代号TOPSECRET9尾”里 TOPSECRET9 已遮；遮“尾”字
+    await req('reviewer', 'POST', `/api/docs/${mid}/annotations`,
+      { kind: 'mask', start: tailPos, end: tailPos + 1, version: mNow.version });
+    const mNow2 = (await req('reviewer', 'GET', `/api/docs/${mid}`)).body;
+    await req('reviewer', 'POST', `/api/docs/${mid}/masks/confirm`, { version: mNow2.version });
+    const kExtAfter = (await req(null, 'GET', `/api/docs/${kid}/external`)).body;
+    ok('放行后母稿新遮罩追加生效', !kExtAfter.content.includes('尾') && kExtAfter.content.includes('█'));
+    ok('另一份仍为空，不被带着亮', (await req(null, 'GET', `/api/docs/${kid2}/external`)).body.content === '');
+
     ok('落盘文件无被遮文字',
       !fs.readFileSync(dataFile, 'utf8').includes('TOPSECRET9') && !fs.readFileSync(dataFile, 'utf8').includes('三段更新'));
 

@@ -14,7 +14,7 @@ class JsonStore {
       secret: null,
       users: {},          // username -> {passHash, role}
       docs: {},           // id -> document
-      counters: { doc: 0, ann: 0, event: 0 }
+      counters: { doc: 0, ann: 0, event: 0, release: 0 }
     };
     this._load();
   }
