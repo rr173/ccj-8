@@ -115,6 +115,34 @@ function mapRange(oldStart, oldEnd, ops) {
   return { start: newStart, end: Math.max(newEnd, newStart), status: 'mapped' };
 }
 
+// 宽松区间映射（遮罩传播专用）：与 mapRange 的“宁丢不错位”相反——
+// 区间内被投放稿删/改过也要把对应的那一段框出来：端点落在删改块内部时
+// 贴到该块的起/止边界，保证母稿确认遮罩后，投放稿里对应位置（哪怕改写过）
+// 整体被遮住；同时只框对应这一处，不碰文中其他相同的字。
+function mapRangeLoose(oldStart, oldEnd, ops) {
+  const startCands = [], endCands = [];
+  for (const [tag, i1, i2, j1, j2] of ops) {
+    if (tag === 'equal') {
+      if (i1 <= oldStart && oldStart <= i2) startCands.push(j1 + (oldStart - i1));
+      if (i1 <= oldEnd && oldEnd <= i2) endCands.push(j1 + (oldEnd - i1));
+    } else if (tag === 'insert') {
+      if (oldStart === i1) startCands.push(j1, j2);
+      if (oldEnd === i1) endCands.push(j1, j2);
+    } else { // delete / replace：端点落边界按边界算，落内部则贴到该块的起/止
+      if (oldStart === i1) startCands.push(j1);
+      else if (oldStart === i2) startCands.push(j2);
+      else if (i1 < oldStart && oldStart < i2) startCands.push(j1);
+      if (oldEnd === i1) endCands.push(j1);
+      else if (oldEnd === i2) endCands.push(j2);
+      else if (i1 < oldEnd && oldEnd < i2) endCands.push(j2);
+    }
+  }
+  if (!startCands.length || !endCands.length) return null;
+  const start = Math.max(...startCands);
+  const end = Math.min(...endCands);
+  return { start, end: Math.max(end, start) };
+}
+
 // ---------- 文档遮罩块 ----------
 // 内容以 code point 文本保存；遮罩块用内联占位符：
 //   '⟦' + n 个 '█' + '⟧'，n = 被遮字符数。
@@ -223,14 +251,16 @@ function validateAuthorEdit(oldText, newText) {
 
 function cpLen(s) { return codePoints(s).length; }
 
-// ---------- 母稿 → 投放稿：段落级三方合并 ----------
+// ---------- 母稿 → 投放稿：三方合并 ----------
 // base   = 投放稿记录的母稿正文（上次同步时）；master = 母稿当前正文；child = 投放稿当前正文。
-// 以“段”（换行分隔）为单位：
+// 先按“段”（换行分隔）对齐：
 //   - 母稿改了、投放稿没改的段 → 跟着母稿变；
-//   - 投放稿自己改过的段 → 保留投放稿的，不被母稿盖掉；
+//   - 投放稿自己改过、母稿没动的段 → 保留投放稿的；
 //   - 母稿删了、投放稿没改 → 删；母稿删了、投放稿改过 → 保留投放稿的；
-//   - 双方在同一段边界各自插入 → 都保留（完全相同的插入只留一份）。
-// 遮罩块不走合并：母稿确认遮罩由 _propagateMasks 强制替换（改过的段也逃不掉）。
+//   - 双方在同一段边界各自插入 → 都保留（完全相同的插入只留一份）；
+//   - 双方都改了同一段 → 段内再按字三方合并（mergeTokens）：投放稿没改过的字
+//     跟着母稿变，改过的字保留（没有换行的文案也能只跟句首、保住句尾）。
+// 遮罩块不走合并：母稿确认遮罩由 _propagateMasks 按位置强制同步（改过的段也逃不掉）。
 function mergeParagraphs(base, master, child) {
   if (child === base) return master;   // 投放稿没动过 → 整份跟母稿
   if (master === base) return child;   // 母稿没变 → 不动
@@ -238,27 +268,47 @@ function mergeParagraphs(base, master, child) {
   const eq = (x, y) => x === y;
   const mSide = paragraphMap(diffOpcodes(B, M, eq), M);
   const cSide = paragraphMap(diffOpcodes(B, C, eq), C);
+  return walkMerge(B, mSide, cSide, eq,
+    (basePara, mPara, cPara) => mergeTokens(basePara, mPara, cPara)).join('\n');
+}
+
+// 段内按字（遮罩块为原子 token）三方合并：同一处两边都改 → 投放稿优先。
+function mergeTokens(base, master, child) {
+  if (child === base) return master;
+  if (master === base) return child;
+  const B = tokenize(base).tokens, M = tokenize(master).tokens, C = tokenize(child).tokens;
+  const eq = (x, y) => x.kind === y.kind && x.text === y.text;
+  const mSide = paragraphMap(diffOpcodes(B, M, eq), M);
+  const cSide = paragraphMap(diffOpcodes(B, C, eq), C);
+  return walkMerge(B, mSide, cSide, eq, (b, m, c) => c).map(t => t.text).join('');
+}
+
+// 三方合并主循环：B 为基准序列，mSide/cSide 是两侧 paragraphMap 的结果。
+// 双方都改了同一项时由 bothChanged(baseItem, masterItem, childItem) 决定结果。
+function walkMerge(B, mSide, cSide, eq, bothChanged) {
   const out = [];
   for (let i = 0; i <= B.length; i++) {
-    // 段边界 i 上双方各自插入的段：都保留，完全相同的去重
+    // 边界 i 上双方各自插入的项：都保留，完全相同的去重
     const ci = cSide.ins.get(i) || [];
     const pool = ci.slice();
     out.push(...ci);
     for (const t of (mSide.ins.get(i) || [])) {
-      const k = pool.indexOf(t);
+      const k = pool.findIndex(x => eq(x, t));
       if (k >= 0) pool.splice(k, 1);
       else out.push(t);
     }
     if (i === B.length) break;
     const m = mSide.map[i], c = cSide.map[i];
-    if (c.type === 'deleted') continue;              // 投放稿自己删了这段
-    if (m.type === 'deleted') {                      // 母稿删了这段
+    if (c.type === 'deleted') continue;              // 投放稿自己删了
+    if (m.type === 'deleted') {                      // 母稿删了
       if (c.type === 'changed') out.push(c.text);    // 投放稿改过 → 保留
       continue;
     }
-    out.push(c.type === 'same' ? m.text : c.text);   // 没改过跟母稿；改过保留本地
+    if (c.type === 'same') { out.push(m.text); continue; }  // 没改过跟母稿
+    if (m.type === 'same') { out.push(c.text); continue; }  // 改过保留本地
+    out.push(bothChanged(B[i], m.text, c.text));            // 两边都改了同一项
   }
-  return out.join('\n');
+  return out;
 }
 
 // 把 base→next 的段落 diff 汇总成：map[i] = base 第 i 段的去向，ins = 各段边界上新增的段
@@ -318,8 +368,8 @@ function unsign(token, secret) {
 function randomToken() { return crypto.randomBytes(24).toString('hex'); }
 
 module.exports = {
-  codePoints, diffOpcodes, mapRange, contentOpcodes,
+  codePoints, diffOpcodes, mapRange, mapRangeLoose, contentOpcodes,
   MARK, MARK_END, maskBlock, extractMasks, tokenize, validateAuthorEdit, cpLen,
-  mergeParagraphs,
+  mergeParagraphs, mergeTokens,
   hashPassword, verifyPassword, sign, unsign, randomToken,
 };

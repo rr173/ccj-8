@@ -8,7 +8,7 @@
 //  - 外部稿接口剥离标记，只给出可公开文本。
 
 const {
-  codePoints, contentOpcodes, mapRange, maskBlock, extractMasks,
+  codePoints, contentOpcodes, mapRange, mapRangeLoose, maskBlock, extractMasks,
   validateAuthorEdit, cpLen, MARK, MARK_END, hashPassword, randomToken,
   mergeParagraphs,
 } = require('./util');
@@ -379,13 +379,14 @@ class Service {
       if (!anns.length) throw httpError(400, '没有可确认的遮罩提议');
 
       // 从后往前把正文文字换成遮罩块
-      let content = doc.content;
+      const preMaskContent = doc.content;
+      let content = preMaskContent;
       const sealed = [];
-      const maskedTexts = []; // 被抹除的原文：只活在本事务内存里用于同步投放稿，不落盘、不进历史
+      const maskedRanges = []; // 被遮区段（遮罩前正文坐标）：只活在本事务内存里用于同步投放稿，不落盘
       const sorted = [...anns].sort((x, y) => y.start - x.start);
       for (const a of sorted) {
         const chars = codePoints(content);
-        maskedTexts.push(chars.slice(a.start, a.end).join(''));
+        maskedRanges.push({ start: a.start, end: a.end });
         const block = maskBlock(a.end - a.start);
         const next = chars.slice(0, a.start).join('') + block + chars.slice(a.end).join('');
         const ops = contentOpcodes(content, next);
@@ -399,8 +400,8 @@ class Service {
       doc.content = content;
       doc.version += 1;
       doc.updatedAt = new Date().toISOString();
-      // 母稿确认的遮罩：所有已派生的投放稿跟着把同一段遮掉（只向下传播，绝不写回）
-      this._propagateMasks(d, doc, maskedTexts, actor);
+      // 母稿确认的遮罩：所有已派生的投放稿跟着把对应的那一处遮掉（只向下传播，绝不写回）
+      this._propagateMasks(d, doc, preMaskContent, maskedRanges, actor);
       return { doc: this._docView(d, doc), sealed };
     });
   }
@@ -461,13 +462,24 @@ class Service {
   }
 
   // ---------- 母稿 → 投放稿：遮罩强制同步 ----------
-  // 母稿确认遮罩 → 所有投放稿（含已冻结的）必须把同一段遮掉：
-  // 不管那段在投放稿里改没改过，原文一个字都不能留。只向下，不写回母稿。
-  _propagateMasks(d, parent, maskedTexts, actor) {
+  // 母稿确认遮罩 → 所有投放稿（含已冻结的）必须把对应的那一处遮掉。
+  // 按“位置对应”同步：把母稿遮罩区段（遮罩前正文坐标）用 token 级 diff 映射进
+  // 投放稿正文——投放稿把那一段改写过的也照遮（对外一个字都读不到），同时只遮
+  // 对应的这一处，文中其他相同的字不被连坐。只向下，不写回母稿。
+  // ranges 使用 parentOldContent（母稿遮罩前正文）的坐标；级联时换算成各投放稿
+  // 自己遮罩前的坐标逐层向下传。
+  _propagateMasks(d, parent, parentOldContent, ranges, actor) {
     for (const child of this._childrenOf(d, parent.id)) {
+      const childOld = child.content;
+      const ops = contentOpcodes(parentOldContent, childOld);
+      const mapped = [];
+      for (const r of ranges) {
+        const m = mapRangeLoose(r.start, r.end, ops);
+        if (m && m.end > m.start) mapped.push(m);
+      }
       let changed = false;
-      for (const text of maskedTexts) {
-        if (this._maskTextInDoc(d, child, text, actor, parent.id)) changed = true;
+      for (const m of mapped.sort((a, b) => b.start - a.start)) {
+        if (this._maskRangeInDoc(d, child, m.start, m.end, actor, parent.id)) changed = true;
       }
       child.baseContent = parent.content;
       child.baseVersion = parent.version;
@@ -475,39 +487,40 @@ class Service {
         child.version += 1;
         child.updatedAt = new Date().toISOString();
       }
-      this._propagateMasks(d, child, maskedTexts, actor); // 级联：投放稿的投放稿
+      this._propagateMasks(d, child, childOld, mapped, actor); // 级联：投放稿的投放稿
     }
   }
 
-  // 把 doc 正文里 text 的每一处出现（已确认遮罩块内部除外）换成遮罩块；
-  // 重叠批注封存、其余批注重定位。与母稿确认同一事务执行，落盘不留 text 副本。
-  _maskTextInDoc(d, doc, text, actor, sourceId) {
-    if (!text) return false;
-    const block = maskBlock(cpLen(text));
-    const blockCpLen = cpLen(block);
-    let replaced = 0;
-    let from = 0; // indexOf 用的 UTF-16 下标
-    for (;;) {
-      const idx = doc.content.indexOf(text, from);
-      if (idx < 0) break;
-      const start = cpLen(doc.content.slice(0, idx));
-      const end = start + cpLen(text);
-      // 已确认遮罩块内部的出现（例如 █）不能动
-      if (extractMasks(doc.content).some(m => start < m.end && end > m.start)) {
-        from = idx + text.length;
-        continue;
-      }
+  // 把 doc 正文 [start,end) 这一段换成遮罩块（已确认遮罩块覆盖的部分除外，
+  // 块是原子不能切）；重叠批注封存、其余批注重定位。与母稿确认同一事务执行，
+  // 落盘不留被遮文字副本。
+  _maskRangeInDoc(d, doc, start, end, actor, sourceId) {
+    if (end <= start) return false;
+    // 扣除已确认遮罩块覆盖的部分
+    const spans = [];
+    let cur = start;
+    for (const m of extractMasks(doc.content)) {
+      if (m.end <= cur) continue;
+      if (m.start >= end) break;
+      if (m.start > cur) spans.push([cur, Math.min(m.start, end)]);
+      cur = Math.max(cur, m.end);
+    }
+    if (cur < end) spans.push([cur, end]);
+    // 从后往前替换，避免坐标移动
+    let erased = 0;
+    for (let i = spans.length - 1; i >= 0; i--) {
+      const [s, e] = spans[i];
       const before = doc.content;
       const chars = codePoints(before);
-      doc.content = chars.slice(0, start).join('') + block + chars.slice(end).join('');
-      this._sealAndRemap(d, doc, contentOpcodes(before, doc.content), start, start + blockCpLen, actor, null);
-      replaced++;
-      from = idx + block.length;
+      const block = maskBlock(e - s);
+      doc.content = chars.slice(0, s).join('') + block + chars.slice(e).join('');
+      this._sealAndRemap(d, doc, contentOpcodes(before, doc.content), s, s + cpLen(block), actor, null);
+      erased += e - s;
     }
-    if (replaced) {
-      this._event(d, 'mask.synced', actor, doc.id, { len: cpLen(text), count: replaced, source: sourceId });
+    if (erased) {
+      this._event(d, 'mask.synced', actor, doc.id, { len: erased, count: spans.length, source: sourceId });
     }
-    return replaced > 0;
+    return erased > 0;
   }
 
   _docView(d, doc) {

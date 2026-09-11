@@ -155,7 +155,7 @@ async function main() {
   ok('派生稿不带母稿批注', (await svc.annotations(k1.id)).length === 0);
   ok('列表带派生关系', (await svc.listDocs()).find(d => d.id === master.id).derived === 2);
 
-  console.log('14) 母稿改未遮的字：没改过的段跟着变，改过的段不被盖掉');
+  console.log('14) 母稿改未遮的字：没改过的跟着变，改过的字保留');
   // k1 自己改第一段和第二段（第二段保留“九千万元”，追加“（含税）”）
   const k1Doc0 = await svc.getDoc(k1.id);
   const k1Local = k1Doc0.content.replace('公开文字甲', '公开文字甲改').replace('报价九千万元整', '报价九千万元整（含税）');
@@ -165,7 +165,7 @@ async function main() {
   await svc.editContent(master.id, mEdit, 'author', 2);
   let k1After = await svc.getDoc(k1.id);
   let k2After = await svc.getDoc(k2.id);
-  ok('k1 自己改过的段不被母稿盖掉', k1After.content.includes('公开文字甲改') && !k1After.content.includes('公开文字乙'));
+  ok('k1 改过的字保留、没改过的字跟着母稿变（段内合并）', k1After.content.includes('公开文字乙改') && !k1After.content.includes('公开文字甲'));
   ok('k1 没改过的段跟着母稿变', k1After.content.includes('联系方式见官网'));
   ok('k1 本地第二段保持', k1After.content.includes('报价九千万元整（含税）'));
   ok('k2 没改过 → 完全跟着母稿', k2After.content.includes('公开文字乙') && k2After.content.includes('联系方式见官网'));
@@ -196,14 +196,14 @@ async function main() {
   ok('同步遮罩时未确认批注跟着位置走', moved2.status === 'proposed' && moved2.covered === '联系方式见官网');
 
   console.log('16) 投放稿自己的批注/遮罩只动这一份；两份投放稿互不覆盖');
-  // k1 自己遮“甲改”
+  // k1 自己遮“乙改”
   const k1Doc2 = await svc.getDoc(k1.id);
-  const pj = cpIndexOf(k1Doc2.content, '甲改');
+  const pj = cpIndexOf(k1Doc2.content, '乙改');
   await svc.addAnnotation({ docId: k1.id, kind: 'mask', start: pj, end: pj + 2, note: '' }, 'reviewer', k1Doc2.version);
   const mBefore = (await svc.getDoc(master.id)).content;
   const k2Before = (await svc.getDoc(k2.id)).content;
   await svc.confirmMasks(k1.id, null, 'reviewer', k1Doc2.version);
-  ok('k1 自己的遮罩生效', !(await svc.getDoc(k1.id)).content.includes('甲改'));
+  ok('k1 自己的遮罩生效', !(await svc.getDoc(k1.id)).content.includes('乙改'));
   ok('派生稿遮罩不写回母稿', (await svc.getDoc(master.id)).content === mBefore);
   ok('另一份投放稿不受影响', (await svc.getDoc(k2.id)).content === k2Before);
   // 打回只恢复这一份
@@ -226,9 +226,9 @@ async function main() {
   ok('改某一份时该份批注跟着位置走', followed.status === 'proposed' && followed.covered === '公开文字乙');
   // 对外看某一份只能看到那一份遮完后的字
   const ext1 = await svc.external(k1.id);
-  ok('k1 对外稿无 k1 已遮文字', !ext1.content.includes('甲改') && !ext1.content.includes('九千万元') && ext1.content.includes('██'));
+  ok('k1 对外稿无 k1 已遮文字', !ext1.content.includes('乙改') && !ext1.content.includes('九千万元') && ext1.content.includes('██'));
   const ext2 = await svc.external(k2.id);
-  ok('k2 对外稿是 k2 自己的字', ext2.content.includes('公开文字乙') && !ext2.content.includes('甲改'));
+  ok('k2 对外稿是 k2 自己的字', ext2.content.includes('公开文字乙') && !ext2.content.includes('乙改'));
 
   console.log('17) 已冻结的投放稿：文字不再同步，遮罩仍强制同步');
   await svc.closeDoc(k2.id, 'reviewer');
@@ -244,7 +244,7 @@ async function main() {
   const k2Frozen = await svc.getDoc(k2.id);
   ok('冻结的投放稿也跟着遮掉', !k2Frozen.content.includes('见官网') && k2Frozen.content.includes('⟦███⟧'));
   const k1After2 = await svc.getDoc(k1.id);
-  ok('k1 本地段里的同样文字也被遮掉', !k1After2.content.includes('见官网') && k1After2.content.includes('首页'));
+  ok('k1 本地段里对应的那处也被遮掉', !k1After2.content.includes('见官网') && k1After2.content.includes('首页'));
 
   console.log('18) 级联派生 + 落盘无任何被遮原文');
   const g = await svc.deriveDoc(k1.id, '孙稿', 'author');
@@ -256,11 +256,55 @@ async function main() {
   ok('孙稿级联遮掉同一段', !gDoc.content.includes('联系方式') && gDoc.content.includes('⟦████⟧'));
   ok('孙稿基准版本跟着 k1 走', gDoc.baseVersion === (await svc.getDoc(k1.id)).version);
   const raw2 = fs.readFileSync(path.join(tmp, 'data.json'), 'utf8');
-  for (const secret of ['OMEGA', '九千万元', '甲改', '见官网', '联系方式', 'SECRETNOTE2']) {
+  for (const secret of ['OMEGA', '九千万元', '乙改', '见官网', '联系方式', 'SECRETNOTE2']) {
     ok(`落盘文件无「${secret}」`, !raw2.includes(secret));
   }
   const allEvents = await svc.events(null, 5000);
-  ok('全部历史无被遮原文', !['OMEGA', '九千万元', '甲改', '见官网', 'SECRETNOTE2'].some(s => JSON.stringify(allEvents).includes(s)));
+  ok('全部历史无被遮原文', !['OMEGA', '九千万元', '乙改', '见官网', 'SECRETNOTE2'].some(s => JSON.stringify(allEvents).includes(s)));
+
+  console.log('19) 无换行文案：投放稿改句尾，母稿改句首 → 句首要跟着变');
+  const oneLine = '开头一句话，中间一句话，结尾一句话。';
+  const mA = await svc.createDoc('单行母稿', oneLine, 'author');
+  const kA = await svc.deriveDoc(mA.id, '单行投放稿', 'author');
+  // 投放稿只改句尾
+  await svc.editContent(kA.id, oneLine.replace('结尾一句话', '结尾一句话改'), 'author', 1);
+  // 母稿再改句首
+  await svc.editContent(mA.id, oneLine.replace('开头一句话', '开头改'), 'author', 1);
+  const kAAfter = await svc.getDoc(kA.id);
+  ok('没改过的句首跟着母稿变', kAAfter.content.includes('开头改'));
+  ok('投放稿自己改的句尾保留', kAAfter.content.includes('结尾一句话改'));
+  ok('中间没动过的地方不变', kAAfter.content.includes('中间一句话'));
+  ok('整篇合并结果精确', kAAfter.content === '开头改，中间一句话，结尾一句话改。');
+
+  console.log('20) 投放稿改过要遮的那串字：母稿确认遮罩后对外读不到');
+  const mB = await svc.createDoc('母稿B', '兹有内部代号DELTA9，请勿外传。', 'author');
+  const kB = await svc.deriveDoc(mB.id, '投放稿B', 'author');
+  // 投放稿把后来要遮的代号改写过
+  await svc.editContent(kB.id, '兹有内部代号德塔九号，请勿外传。', 'author', 1);
+  const mBDoc = await svc.getDoc(mB.id);
+  const dPos = cpIndexOf(mBDoc.content, 'DELTA9');
+  await svc.addAnnotation({ docId: mB.id, kind: 'mask', start: dPos, end: dPos + 6, note: '' }, 'reviewer', mBDoc.version);
+  await svc.confirmMasks(mB.id, null, 'reviewer', mBDoc.version);
+  const kBAfter = await svc.getDoc(kB.id);
+  ok('投放稿改写过的代号也被遮掉', !kBAfter.content.includes('德塔九号') && kBAfter.content.includes('⟦████⟧'));
+  ok('遮罩只盖代号、上下文不动', kBAfter.content === '兹有内部代号⟦████⟧，请勿外传。');
+  const kBExt = await svc.external(kB.id);
+  ok('对外读不到改过的代号', !kBExt.content.includes('德塔九号') && kBExt.content.includes('████'));
+  const rawB = fs.readFileSync(path.join(tmp, 'data.json'), 'utf8');
+  ok('落盘文件无改写过的代号', !rawB.includes('德塔九号') && !rawB.includes('DELTA9'));
+
+  console.log('21) 母稿只遮开头一处相同的字：投放稿结尾那处不被连坐');
+  const mC = await svc.createDoc('母稿C', '代号ALPHA开头，中间无关，结尾又是ALPHA。', 'author');
+  const kC = await svc.deriveDoc(mC.id, '投放稿C', 'author');
+  const mCDoc = await svc.getDoc(mC.id);
+  const firstAlpha = cpIndexOf(mCDoc.content, 'ALPHA'); // 只遮第一处
+  await svc.addAnnotation({ docId: mC.id, kind: 'mask', start: firstAlpha, end: firstAlpha + 5, note: '' }, 'reviewer', mCDoc.version);
+  await svc.confirmMasks(mC.id, null, 'reviewer', mCDoc.version);
+  const kCAfter = await svc.getDoc(kC.id);
+  ok('对应的那一处被遮掉', kCAfter.content.includes('代号⟦█████⟧开头'));
+  ok('结尾相同的字不被连坐', kCAfter.content.includes('结尾又是ALPHA。'));
+  const kCExt = await svc.external(kC.id);
+  ok('对外稿也只遮那一处', kCExt.content.includes('代号█████开头') && kCExt.content.includes('结尾又是ALPHA。'));
 
   console.log(`\n全部通过：${passed} 项断言`);
 }
