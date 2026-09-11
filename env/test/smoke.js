@@ -802,6 +802,155 @@ async function main() {
     rcPersist.callbacks[rcDoc.id][0].refusals[0].paragraph === 1
     && typeof rcPersist.callbacks[rcDoc.id][0].refusals[0].chars === 'number');
 
+  console.log('29) 泄露事故单：对已记泄露的某笔回传/某一处开单；对得上的字任何渠道都抽空');
+  // 母稿+投放稿，三段，先放行第一、三段；渠道回传夹带未放行的第二段（段缝 insert）
+  const inText = '事故首段甲。\n事故二段乙。\n事故三段丙。';
+  const inMaster = await svc.createDoc('事故母稿', inText, 'author');
+  const inDoc = await svc.deriveDoc(inMaster.id, '事故投放稿', 'author');
+  await svc.releaseParagraph(inDoc.id, 0, 'author', 1);
+  await svc.releaseParagraph(inDoc.id, 2, 'author', (await svc.getDoc(inDoc.id)).version);
+  const inExtBefore = (await svc.external(inDoc.id)).content;
+  ok('开单前外面只有第一、三段', inExtBefore === '事故首段甲。\n事故三段丙。');
+
+  // 开单门槛：审阅人不能开；母稿不能开；干净回传不能开；不存在的回传/越界泄露号 404
+  const errInReviewer = await svc.openIncident(inDoc.id, 'cb_x', 0, 'x', 'reviewer', null).then(() => null, e => e);
+  ok('审阅人不能开事故单', errInReviewer && errInReviewer.status === 403);
+  const errInMaster = await svc.openIncident(inMaster.id, 'cb_x', 0, 'x', 'author', null).then(() => null, e => e);
+  ok('母稿不能开事故单', errInMaster && errInMaster.status === 400);
+
+  // 没放行过/干净的稿登记一笔干净回传：开不了单
+  const cleanDoc = await svc.deriveDoc(inMaster.id, '全放行干净稿', 'author');
+  for (let p = 0; p < 3; p++) await svc.releaseParagraph(cleanDoc.id, p, 'author', (await svc.getDoc(cleanDoc.id)).version);
+  const cleanCbRec = await svc.registerCallback(cleanDoc.id, '渠道净', (await svc.external(cleanDoc.id)).content, 'author');
+  ok('干净回传 0 处泄露', cleanCbRec.callback.leak.count === 0);
+  const errNoLeak = await svc.openIncident(cleanDoc.id, cleanCbRec.callback.id, 0, 'x', 'author', null).then(() => null, e => e);
+  ok('没记过泄露的回传开不了单', errNoLeak && errNoLeak.status === 404);
+  const errNoCb = await svc.openIncident(inDoc.id, 'cb_不存在', 0, 'x', 'author', null).then(() => null, e => e);
+  ok('不存在的回传开不了单', errNoCb && errNoCb.status === 404);
+
+  // 渠道甲夹带第二段 → 记一笔泄露（位置指纹：缝 rel_1..rel_2 之间）
+  const inCb = await svc.registerCallback(inDoc.id, '渠道甲', inText, 'author');
+  const inCbRec = (await svc.callbacks(inDoc.id, '渠道甲')).callbacks[0];
+  ok('夹带未放行段：记泄露', inCbRec.leak.count === 1 && inCb.leakFragments[0].includes('二段乙'));
+  const inItem = inCbRec.leak.items[0];
+  ok('泄露位置指纹是段缝且泄露行已还原（记录前后放行 id，不含被泄露的字）',
+    inItem.locator.kind === 'gap' && inItem.locator.before && inItem.locator.after
+    && inItem.locator.lines[0].len === 6
+    && JSON.stringify(inItem.locator).indexOf('事故二段乙') < 0);
+  const inFrag = inCb.leakFragments[0];
+
+  const errBadFrag = await svc.openIncident(inDoc.id, inCbRec.id, 0, '不对的字', 'author', null).then(() => null, e => e);
+  ok('交回片段与指纹对不上：拒绝', errBadFrag && errBadFrag.status === 409);
+  const errBadIdx = await svc.openIncident(inDoc.id, inCbRec.id, 99, inFrag, 'author', null).then(() => null, e => e);
+  ok('泄露片段序号越界：拒绝', errBadIdx && errBadIdx.status === 404);
+
+  // 开单时第二段尚未放行（缝里空），立即抽不到任何字
+  const inVer = (await svc.getDoc(inDoc.id)).version;
+  const inOrder = await svc.openIncident(inDoc.id, inCbRec.id, 0, inFrag, 'author', inVer);
+  ok('事故单创建成功（id/回传/渠道/序号）', inOrder.incident.id.startsWith('in_')
+    && inOrder.incident.callbackId === inCbRec.id && inOrder.incident.channel === '渠道甲'
+    && inOrder.incident.leakIndex === 0);
+  ok('开单推进文档版本', inOrder.doc.version === inVer + 1);
+  ok('缝里还没有放行段：当场抽不到字', inOrder.vacuumed.length === 0);
+
+  // 同一处泄露不能开两次
+  const errDup = await svc.openIncident(inDoc.id, inCbRec.id, 0, inFrag, 'author', (await svc.getDoc(inDoc.id)).version).then(() => null, e => e);
+  ok('同一处泄露不能开两次', errDup && errDup.status === 409);
+
+  // 放行第二段：事故单盯住段缝，与泄露行逐字相同 → 立即抽空
+  await svc.releaseParagraph(inDoc.id, 1, 'author', (await svc.getDoc(inDoc.id)).version);
+  const inExt = await svc.external(inDoc.id);
+  ok('放行缝里的泄露段：公开口径这处抽空成 █',
+    inExt.content === '事故首段甲。\n██████\n事故三段丙。'
+    && !inExt.content.includes('事故二段乙'));
+  const inExtA = await svc.external(inDoc.id, '渠道甲');
+  const inExtB = await svc.external(inDoc.id, '其他渠道');
+  ok('任何渠道（含没被召回的渠道）都对不上原文',
+    !inExtA.content.includes('事故二段乙') && !inExtB.content.includes('事故二段乙'));
+  ok('对不上的字（第一、三段）不跟着抽',
+    inExt.content.includes('事故首段甲') && inExt.content.includes('事故三段丙'));
+
+  // 事故不改正文、不复活已遮字
+  const inDocView = await svc.getDoc(inDoc.id);
+  ok('事故不改正文（内部原文还在）', inDocView.content.includes('事故二段乙'));
+
+  // 查账：开过哪些事故、对着哪处泄露、各渠道看不看得到
+  const inLedger = await svc.incidentLedger(inDoc.id);
+  ok('事故账有 1 单、带逐渠道状态', inLedger.count === 1
+    && inLedger.incidents[0].channels.some(c => c.channel === null && c.status === 'masked')
+    && inLedger.incidents[0].channels.some(c => c.channel === '渠道甲' && c.status === 'masked')
+    && inLedger.incidents[0].visible === false);
+
+  // 落盘：事故单/位置指纹/事件都不含被泄露的字
+  const rawIn = fs.readFileSync(path.join(tmp, 'data.json'), 'utf8');
+  ok('落盘事故记录不含泄露的字', !JSON.stringify(JSON.parse(rawIn).docs[inDoc.id].incidents).includes('事故二段乙'));
+  const inEvents = await svc.events(inDoc.id);
+  ok('事故事件只记指纹/字数/放行 id，不含泄露的字',
+    inEvents.some(e => e.type === 'incident.opened')
+    && !JSON.stringify(inEvents).includes('事故二段乙'));
+
+  console.log('30) 事故单的位置语义：被召回渠道泄露也抽全渠道；别处相同的字不连坐；replace 型不抽');
+  // 四段全放行，渠道甲召回第二段；全量送回 → 该段对该渠道是缝里泄露（拒不召回+泄露）
+  const rc2Text = '连坐首段甲。\n连坐二段乙。\n连坐三段丙。\n连坐四段丁。';
+  const rc2Master = await svc.createDoc('连坐母稿', rc2Text, 'author');
+  const rc2Doc = await svc.deriveDoc(rc2Master.id, '连坐投放稿', 'author');
+  for (let p = 0; p < 4; p++) await svc.releaseParagraph(rc2Doc.id, p, 'author', (await svc.getDoc(rc2Doc.id)).version);
+  await svc.recallParagraphs(rc2Doc.id, '渠道甲', [1], 'author', (await svc.getDoc(rc2Doc.id)).version);
+  const rc2Cb = await svc.registerCallback(rc2Doc.id, '渠道甲', rc2Text, 'author');
+  const rc2Rec = (await svc.callbacks(rc2Doc.id, '渠道甲')).callbacks[0];
+  ok('被召回渠道送回：泄露 + 拒不召回', rc2Rec.refusals.length === 1 && rc2Rec.leak.count >= 1);
+  const rc2ItemIdx = rc2Rec.leak.items.findIndex(it => it.locator && it.locator.kind === 'gap');
+  await svc.openIncident(rc2Doc.id, rc2Rec.id, rc2ItemIdx, rc2Cb.leakFragments[rc2ItemIdx],
+    'author', (await svc.getDoc(rc2Doc.id)).version);
+  const rc2Pub = await svc.external(rc2Doc.id);
+  const rc2Other = await svc.external(rc2Doc.id, '渠道乙');
+  const rc2Self = await svc.external(rc2Doc.id, '渠道甲');
+  ok('被召回渠道泄露：公开口径与其他渠道也抽空该段',
+    !rc2Pub.content.includes('连坐二段乙') && !rc2Other.content.includes('连坐二段乙'));
+  ok('被点名渠道本就空着（召回+事故后仍空）', !rc2Self.content.includes('连坐二段乙'));
+  ok('段缝外的三段不连坐',
+    rc2Pub.content.includes('连坐首段甲') && rc2Pub.content.includes('连坐三段丙') && rc2Pub.content.includes('连坐四段丁'));
+  const rc2Raw = JSON.parse(fs.readFileSync(path.join(tmp, 'data.json'), 'utf8'));
+  const rc2Rel2 = rc2Raw.docs[rc2Doc.id].releases.find(r => r.paragraphIndex === 1);
+  ok('被抽段登记了事故来源（incidentScrubs）', rc2Rel2.anchor.match(/^⟦█+⟧$/)
+    && rc2Rel2.incidentScrubs[0].incident.startsWith('in_'));
+
+  // replace 型泄露（已遮代号按原文送回）：位置只可能变少，开单不抽任何字，状态可查
+  const rpText = '代号ORION42机密。\n普通第二段。';
+  const rpMaster = await svc.createDoc('replace母稿', rpText, 'author');
+  const rpDoc = await svc.deriveDoc(rpMaster.id, 'replace投放稿', 'author');
+  const rpPos = cpIndexOf(rpText, 'ORION42');
+  await nodBoth(rpMaster.id, rpPos, rpPos + 7, 1);
+  for (let p = 0; p < 2; p++) await svc.releaseParagraph(rpDoc.id, p, 'author', (await svc.getDoc(rpDoc.id)).version);
+  const rpCb = await svc.registerCallback(rpDoc.id, '渠道一', rpText, 'author');
+  const rpRec = (await svc.callbacks(rpDoc.id, '渠道一')).callbacks[0];
+  ok('replace 型位置指纹（段内坐标 span）', rpRec.leak.items[0].locator.kind === 'span'
+    && typeof rpRec.leak.items[0].locator.start === 'number');
+  const rpBefore = (await svc.external(rpDoc.id)).content;
+  await svc.openIncident(rpDoc.id, rpRec.id, 0, rpCb.leakFragments[0], 'author', (await svc.getDoc(rpDoc.id)).version);
+  ok('replace 型开单不抽字（外面本就只有 █）', (await svc.external(rpDoc.id)).content === rpBefore);
+  const rpLedger = await svc.incidentLedger(rpDoc.id);
+  ok('replace 型事故状态可查（masked：那处字已是 █）',
+    rpLedger.incidents[0].channels[0].status === 'masked' && rpLedger.incidents[0].visible === false);
+
+  console.log('31) 事故单不可改不可撤：没有改/删接口；已抽的字不会因再回传/再放亮回来');
+  // 同一渠道合规再回传一次：事故抽掉的段不会回来；再送一次旧账仍在
+  const inGood = await svc.registerCallback(inDoc.id, '渠道甲', (await svc.external(inDoc.id, '渠道甲')).content, 'author');
+  ok('按抽后视图回传：本笔干净', inGood.callback.clean === true);
+  ok('事故抽空不被新回传复活', !(await svc.external(inDoc.id)).content.includes('事故二段乙'));
+  // 同一段重复放行本就 409（不可再放亮）
+  const errRelAgain = await svc.releaseParagraph(inDoc.id, 1, 'author', (await svc.getDoc(inDoc.id)).version).then(() => null, e => e);
+  ok('已放行段不能重复放行刷新（事故抽空不会被刷新盖掉）', errRelAgain && errRelAgain.status === 409);
+  // 事故记录只追加：落盘 incidents 数组里只有字段、无修改痕迹（数量不变）
+  const inPersist = JSON.parse(fs.readFileSync(path.join(tmp, 'data.json'), 'utf8'));
+  ok('事故单只存回传 id/渠道/序号/指纹/位置，不存泄露原文',
+    inPersist.docs[inDoc.id].incidents.length === 1
+    && inPersist.docs[inDoc.id].incidents[0].callbackId === inCbRec.id
+    && !('text' in inPersist.docs[inDoc.id].incidents[0]));
+  // 文档视图带事故单
+  ok('文档视图带事故单列表', (await svc.getDoc(inDoc.id)).incidents.length === 1
+    && (await svc.listDocs()).find(x => x.id === inDoc.id).incidents === 1);
+
   console.log(`\n全部通过：${passed} 项断言`);
 }
 main().catch(e => { console.error('测试失败:', e); process.exit(1); });

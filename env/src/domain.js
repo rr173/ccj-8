@@ -58,6 +58,7 @@ class Service {
       updatedAt: doc.updatedAt, masks: extractMasks(doc.content).length,
       parentId: doc.parentId || null,
       released: (doc.releases || []).length,
+      incidents: (doc.incidents || []).length,
       paragraphs: paragraphBounds(doc.content).length,
       derived: Object.values(d.docs).filter(x => x.parentId === doc.id).length,
       callbacks: ((d.callbacks && d.callbacks[doc.id]) || []).length,
@@ -76,6 +77,7 @@ class Service {
         id, title, content, version: 1, status: 'open',
         createdAt: now, updatedAt: now, closedAt: null,
         parentId: null, baseContent: null, baseVersion: null, releases: [], recalls: [],
+        incidents: [],
       };
       d.docs[id] = doc;
       d._ann = d._ann || {};
@@ -105,6 +107,7 @@ class Service {
         baseVersion: parent.version,
         releases: [],                  // 投放稿的对外放行按段独立记录，不随派生复制
         recalls: [],                   // 渠道召回令同样按份独立，不随派生复制
+        incidents: [],                 // 泄露事故单同样按份独立，不随派生复制
       };
       d.docs[newId] = doc;
       this._event(d, 'doc.derived', actor, parent.id, { child: newId, title: doc.title });
@@ -167,6 +170,9 @@ class Service {
         createdAt: new Date().toISOString(),
       };
       doc.releases.push(release);
+      // 事故单一旦开了：新放行的段若正好落在某张事故单盯住的段缝里、且与泄露行
+      // 逐字相同，放行快照拍下来即抽空——对得上的字不能借新放行再出现在外面。
+      this._enforceIncidentsOnNewRelease(d, doc, release, actor);
       doc.version += 1;
       doc.updatedAt = new Date().toISOString();
       this._event(d, 'paragraph.released', actor, id, { release: rid, paragraph: paragraphIndex });
@@ -306,6 +312,27 @@ class Service {
     return this._eraseAnchorRanges(r, [[s, e]]);
   }
 
+  // 在放行快照上按【对外可见坐标】（_anchorVisible 的结果，█ 与普通字等长）
+  // 抹字：换算成 anchor 内部 code-point 坐标（⟦⟧ 哨兵各占 1 位）后复用
+  // _eraseAnchorRanges，块是原子自动跳过。事故单抽空放行段走这里。
+  _eraseAnchorVisibleRanges(r, ranges) {
+    const chars = codePoints(r.anchor);
+    // 先扫出“可见位 → anchor 内 code-point 下标”的对照表（⟦⟧ 哨兵与 █ 不占可见位）
+    const visToInner = [];
+    for (let i = 0; i < chars.length; i++) {
+      if (chars[i] === MARK) {
+        let j = i + 1;
+        while (chars[j] === '█') j++;
+        if (chars[j] === MARK_END) { i = j; continue; }
+      }
+      visToInner.push(i);
+    }
+    const spans = ranges
+      .map(([vs, ve]) => [visToInner[vs], visToInner[Math.min(ve, visToInner.length) - 1] + 1])
+      .filter(([s, e]) => Number.isInteger(s) && Number.isInteger(e) && e > s);
+    return this._eraseAnchorRanges(r, spans);
+  }
+
   // code-point 偏移落在第几段（按换行计）
   _indexOfOffset(text, offset) {
     const chars = codePoints(text);
@@ -321,6 +348,7 @@ class Service {
       start: r.start, end: r.end,
       releasedBy: r.releasedBy, releasedAt: r.releasedAt,
       masks: extractMasks(r.anchor).length,
+      incidentScrubs: (r.incidentScrubs || []).map(s => ({ incident: s.incident, len: s.len })),
     };
   }
 
@@ -504,51 +532,171 @@ class Service {
     const recalledIds = new Set((doc.recalls || [])
       .filter(o => o.channel === channel)
       .flatMap(o => o.releaseIds));
-    const rels = (doc.releases || []).slice().sort((a, b) => {
+    const rels = this._sortedReleases(doc);
+    const parts = [];
+    for (const r of rels) {
+      if (channel && recalledIds.has(r.id)) continue;
+      parts.push({ release: r.id, index: r.paragraphIndex, text: this._anchorVisible(r.anchor) });
+    }
+    return parts;
+  }
+
+  // 放行记录按“当前段序”排序（对外拼接、事故定位共用同一顺序，保证位置一致）
+  _sortedReleases(doc) {
+    return (doc.releases || []).slice().sort((a, b) => {
       const ia = a.currentIndex, ib = b.currentIndex;
       if (ia !== null && ib !== null && ia !== ib) return ia - ib;
       if (ia === null && ib !== null) return 1;   // 段已被改动、失去现位置的排在后
       if (ib === null && ia !== null) return -1;
       return a.createdAt < b.createdAt ? -1 : 1;
     });
-    const parts = [];
-    for (const r of rels) {
-      if (channel && recalledIds.has(r.id)) continue;
-      const chars = codePoints(r.anchor);
-      let text = '', i = 0;
-      while (i < chars.length) {
-        if (chars[i] === MARK) {
-          let j = i + 1, n = 0;
-          while (chars[j] === '█') { n++; j++; }
-          if (chars[j] === MARK_END) {
-            text += '█'.repeat(n);
-            i = j + 1; continue;
-          }
+  }
+
+  // 放行快照 anchor（含 ⟦██⟧ 系统标记）→ 对外可见字（剥标记，█ 等长呈现）
+  _anchorVisible(anchor) {
+    const chars = codePoints(anchor);
+    let text = '', i = 0;
+    while (i < chars.length) {
+      if (chars[i] === MARK) {
+        let j = i + 1, n = 0;
+        while (chars[j] === '█') { n++; j++; }
+        if (chars[j] === MARK_END) {
+          text += '█'.repeat(n);
+          i = j + 1; continue;
         }
-        text += chars[i]; i++;
       }
-      parts.push({ release: r.id, index: r.paragraphIndex, text });
+      text += chars[i]; i++;
     }
-    return parts;
+    return text;
+  }
+
+  // 各段用换行连接（不补发被省略/未放行/被召回段的空行）
+  _joinParts(parts) {
+    return parts.map(p => p.text).join('\n');
   }
 
   _externalReleased(d, doc, channel) {
     const parts = this._externalParts(d, doc, channel || null);
-    // 各段用换行连接，不补发被省略/未放行/被召回段的空行；遮罩区间按拼接位置平移
+    // 遮罩区间按拼接位置平移
     const ranges = [];
-    const texts = [];
     let base = 0;
     for (const p of parts) {
       for (const m of p.text.matchAll(/█+/g)) {
         ranges.push({ start: base + m.index, end: base + m.index + m[0].length, len: m[0].length });
       }
-      texts.push(p.text);
       base += p.text.length + 1;
     }
     // 未放行任何段（或可见段都被该渠道召回）：空字符串，不泄露段数与篇幅
-    return { id: doc.id, title: doc.title, status: doc.status, content: texts.join('\n'),
+    return { id: doc.id, title: doc.title, status: doc.status, content: this._joinParts(parts),
       masks: ranges, released: (doc.releases || []).length,
       visible: parts.length, channel: channel || null, closedAt: doc.closedAt };
+  }
+
+  // ---------- 泄露位置指纹（回传登记时算，事故单据此抽字，只存位置+指纹不存字） ----------
+  // insert（段缝里多出来的字）：Myers diff 可能把“中间整段插入”两端与相邻段相同的
+  // 上下文吞进 equal，insert 片段于是形如「泄露整行 + 换行 + 下一段的行首」。因此按
+  // 换行拆行后，只把【首行与插入点前一段的结尾相同】或【末行与插入点后一段的开头
+  // 相同】的行视为吞进 equal 的拼接上下文；剩下的行才真正是从【两条放行记录之间的
+  // 段缝】里漏出去的整段：
+  //   - 有段缝行 → gap（before/after 为相邻放行记录 id；lines 只存泄露行指纹/字数），
+  //     事故单开出后这条缝里以后出现、与泄露行逐字相同的段必须抽空，别处相同的字不连坐；
+  //   - 全是段内字 → inside（对不上任何放行段，不会误伤本来就能看到的字；只能靠指纹查）。
+  _locateInsert(offset, parts, fragment) {
+    // 段缝：offset 贴在某段边界（段尾换行前 end、换行位、下段首字 start）。
+    // Myers 对齐中间整段插入时，offset 还可能落在【下段行首内】：因为下段行首与
+    // 泄露行前缀相同的一截被 equal 吞掉、insert 从行首之后开始；同理也可能落在
+    // 上段行尾内。用“offset 距离最近的缝点 + 片段首/尾与相邻段行的公共前后缀”
+    // 还原真正的段缝。段内插入（与任何边界都不沾）→ inside，不产生段缝事故位。
+    const spans = [];
+    let pos = 0;
+    for (const p of parts) {
+      const len = cpLen(p.text);
+      spans.push({ p, start: pos, end: pos + len });
+      pos += len + 1;
+    }
+    let prev = null, next = null, kind = 'inside';
+    let headPrefix = '', tailSuffix = '';
+    for (let k = 0; k < spans.length; k++) {
+      const s = spans[k];
+      const sHead = s.p.text.split('\n')[0];
+      const sTail = s.p.text.split('\n').pop();
+      if (offset === s.end || (spans[k + 1] && offset === spans[k + 1].start)) {
+        prev = s.p; next = spans[k + 1] ? spans[k + 1].p : null; kind = 'gap'; break;
+      }
+      if (k === 0 && offset === 0) { prev = null; next = s.p; kind = 'gap'; break; }
+      // offset 进到段 k 行首内：后段行首被 equal 吞掉一截，片段末行整行就是这截字
+      // （它是后段行首续接，不是泄露本体）；这截字要补回泄露行的行首
+      if (k > 0 && offset >= s.start && offset < s.start + cpLen(sHead)) {
+        const swallowed = codePoints(sHead).slice(0, offset - s.start).join('');
+        if (swallowed && fragment.split('\n').pop() === swallowed) {
+          prev = spans[k - 1].p; next = s.p; kind = 'gap'; headPrefix = swallowed; break;
+        }
+      }
+      // offset 进到段 k 行尾内：对称情形——前段行尾被吞，片段首行整行是这截字
+      // （offset 恰在段尾 end 时上面已按标准缝处理）
+      const tailStart = s.end - cpLen(sTail);
+      if (offset > tailStart && offset < s.end) {
+        const swallowed = codePoints(sTail).slice(offset - tailStart).join('');
+        if (fragment.split('\n')[0] === swallowed) {
+          prev = s.p; next = spans[k + 1] ? spans[k + 1].p : null; kind = 'gap'; tailSuffix = swallowed; break;
+        }
+      }
+    }
+    if (kind !== 'gap') {
+      return { kind: 'inside', release: this._partAtOffset(parts, offset) };
+    }
+
+    // 剥掉片段两端被 equal 吞掉的相邻段行首/行尾整行（只按整行剥：部分前后缀粘连
+    // 不剥，宁可保留也不漏抽）；再把被吞的行首/行尾字补回泄露行本体。
+    const lines = codePoints(fragment).join('').split('\n').filter(l => l.length > 0);
+    const gapLines = lines.map((line, i) => {
+      if (prev && i === 0) {
+        const prevTail = prev.text.split('\n').pop();
+        if (line === prevTail) return null;
+        if (lines.length > 1 && prevTail.endsWith(line) && line !== prevTail) return null;
+      }
+      if (next && i === lines.length - 1) {
+        const nextHead = next.text.split('\n')[0];
+        if (line === nextHead) return null;
+        if (lines.length > 1 && nextHead.startsWith(line) && line !== nextHead) return null;
+      }
+      if (i === 0 && headPrefix) line = headPrefix + line;
+      if (i === lines.length - 1 && tailSuffix) line = line + tailSuffix;
+      return line;
+    }).filter(Boolean);
+
+    if (gapLines.length) {
+      return {
+        kind: 'gap', before: prev ? prev.release : null, after: next ? next.release : null,
+        lines: gapLines.map(l => ({ sha256: sha256Hex(l), len: cpLen(l) })),
+      };
+    }
+    return { kind: 'inside', release: next ? next.release : (prev ? prev.release : null) };
+  }
+
+  _partAtOffset(parts, offset) {
+    let pos = 0;
+    for (const p of parts) {
+      if (offset >= pos && offset < pos + cpLen(p.text)) return p.release;
+      pos += cpLen(p.text) + 1;
+    }
+    return null;
+  }
+
+  // replace（已可见位置对不上的字）：位置只会因新遮罩而变成 █，外面不会从这个位置
+  // 再冒出原文，所以事故单从不据此抽字；但要留得住“这处字现在还看不看得到”的证据。
+  //   - 整段都落在同一条放行段内 → span（段内可见坐标，逐字查得到还在不在）；
+  //   - 跨过拼接换行（涉及多条放行段）→ span-multi，只能靠整串指纹在全文查。
+  _locateReplace(start, end, parts) {
+    let pos = 0;
+    for (const p of parts) {
+      const s = pos, e = pos + cpLen(p.text);
+      pos = e + 1;
+      if (start >= s && end <= e) {
+        return { kind: 'span', release: p.release, start: start - s, end: end - s };
+      }
+    }
+    return { kind: 'span-multi' };
   }
 
   // ---------- 渠道回传记账（只追加、永不修改/抹除） ----------
@@ -584,12 +732,30 @@ class Service {
 
       const received = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
       // 该渠道此刻外面能看见的字：被点名召回的段对该渠道必须是空的。
-      const chanExt = this._externalReleased(d, doc, chan);
+      const chanParts = this._externalParts(d, doc, chan);
+      const chanExt = { content: this._joinParts(chanParts) };
       // 对账分两层，互不连坐：
       //   1) 跟【该渠道视图】对 → 常规的干净 / 泄露 / 少发（没被点名召回的段照常）；
       //   2) 跟【全量视图】对，只看“该渠道被召回的段”是否还被送回来 → 拒不召回。
       const verdict = this._reconcileCallback(chanExt.content, received);
       const fullVerdict = this._reconcileCallback(fullExt.content, received);
+
+      // 每处泄露在事故定位上的“位置指纹”（不存泄露的字，只存它当时相对放行快照
+      // 的位置关系 + 字指纹）：
+      //   insert  在段缝里多出来的字 → 前后两条放行记录之间的“段缝”，按整行落位，
+      //           其中落在段内的插入无法对应放行段（inside/unlocatable）；
+      //   replace 已可见段里对不上的字 → 落到该条放行记录的段内坐标（span），
+      //           这种位置外面的字只会变少（被遮罩），事故单开了也抽不到字，
+      //           只用于查“这处字现在还看不看得到”。
+      const leakItems = verdict.leaks.map((frag, k) => {
+        const op = verdict.leakOps[k];
+        const item = { len: cpLen(frag), sha256: sha256Hex(frag) };
+        if (op) {
+          if (op[0] === 'insert') item.locator = this._locateInsert(op[1], chanParts, frag);
+          else item.locator = this._locateReplace(op[1], op[2], chanParts);
+        }
+        return item;
+      });
 
       // 被点名召回的放行段：按全量视图里的段号取回在场判定；全 █ 段没有可见字
       // 可作“原文还带着”的证据（本就读不到原文），不计拒不召回。
@@ -619,10 +785,11 @@ class Service {
         chars: cpLen(received),
         clean: verdict.clean && refusals.length === 0,
         leak: {
-          count: verdict.leaks.length,
+          count: leakItems.length,
           chars: verdict.leakChars,
-          // 每处泄露片段只存指纹，不存字——回传不能把抹掉的字救回落盘文件
-          items: verdict.leaks.map(f => ({ len: cpLen(f), sha256: sha256Hex(f) })),
+          // 每处泄露片段只存指纹，不存字——回传不能把抹掉的字救回落盘文件；
+          // locator 是它相对放行快照的位置指纹（同样不含被泄露的字）。
+          items: leakItems,
         },
         missing: verdict.missing,
         refusals,   // 拒不召回：只追加、不可改、再送一次也抹不掉（只存段号/字数）
@@ -657,13 +824,16 @@ class Service {
     const rcvChars = codePoints(received);
     const ops = diffOpcodes(extChars, rcvChars);
     const leakRanges = [];   // received 坐标里“外面没有”的区间
+    const leakOps = [];      // 造成泄露的原始 diff op（事故单定位用：insert=段缝里多出来的段，replace=对不上的字）
     // 每个对外字的下场：'eq' 照发 | 'rep' 发了对不上的字 | 'del' 没发 | null 未覆盖
     const cover = new Array(extChars.length).fill(null);
     for (const [tag, i1, i2, j1, j2] of ops) {
       if (tag === 'insert') {
         leakRanges.push([j1, j2]);
+        leakOps.push(['insert', i1, i2, j1, j2]);
       } else if (tag === 'replace') {
         leakRanges.push([j1, j2]);
+        leakOps.push(['replace', i1, i2, j1, j2]);
         for (let k = i1; k < i2; k++) cover[k] = 'rep';
       } else if (tag === 'delete') {
         for (let k = i1; k < i2; k++) cover[k] = 'del';
@@ -691,11 +861,12 @@ class Service {
       if (i !== extChars.length && extChars[i] !== '\n') continue;
       const len = i - pStart;
       if (len > 0) {
-        let visible = 0, visibleExact = 0, masked = 0, maskedFilled = 0;
+        let visible = 0, visibleExact = 0, masked = 0, maskedFilled = 0, maskedEchoed = 0;
         for (let k = pStart; k < i; k++) {
           if (extChars[k] === '█') {
             masked++;
             if (cover[k] === 'rep') maskedFilled++;
+            if (cover[k] === 'eq') maskedEchoed++;   // 连 █ 也逐字照发：段在场
           } else {
             visible++;
             if (cover[k] === 'eq') visibleExact++;
@@ -704,14 +875,14 @@ class Service {
         presence[pIdx] = { visible, visibleExact, masked, maskedFilled };
         const present = visible > 0
           ? visibleExact / visible >= RATIO
-          : maskedFilled === masked;
+          : (maskedFilled + maskedEchoed) === masked;
         if (!present) missing.push({ index: pIdx, len });
       }
       pStart = i + 1; pIdx++;
     }
 
     const clean = leakRanges.length === 0 && missing.length === 0;
-    return { clean, leaks, leakChars, missing, presence };
+    return { clean, leaks, leakChars, missing, presence, leakOps };
   }
 
   _callbackView(c) {
@@ -757,6 +928,287 @@ class Service {
       if (c.clean) s.clean += 1;
     }
     return Object.values(byChannel);
+  }
+
+  // ---------- 泄露事故单（仅作者开单；只追加、不可改/不可撤；同一处泄露不能开两次） ----------
+  // 作者对着某一份投放稿、某一笔已经记下泄露的回传、其中某一处泄露开事故单。
+  // 开单时必须把【登记回传时见过一次的原始泄露片段】再交回来，服务端只拿它和账上
+  // 存着的 SHA-256 指纹 + 字数对一遍（对不上拒绝），随后即弃，不落盘。
+  // 开单的效果（同事务）：
+  //   - 任何渠道（含公开口径）再看这份，对外快照里【对得上这处泄露的字】必须抽空成
+  //     █，原文翻不出来；对不上的字一个都不跟着抽——按位置指纹落位（段缝里的整段、
+  //     段内固定坐标），不是全文替换，文中别处相同的字不连坐；
+  //   - 只动放行快照（外面能读到的字）：内部正文不动，已经抹掉的字也救不回来；
+  //   - 以后新放行的段若正好落到事故单盯住的段缝、且与泄露行逐字相同，放行时照抽；
+  //   - 事故单一开就不能改、不能撤；同一处泄露（同笔回传 + 同序号片段）不能开两次；
+  //   - 没记过泄露的回传开不了单。
+  async openIncident(docId, callbackId, leakIndex, fragment, actor, expectedVersion) {
+    if (actor !== 'author') throw httpError(403, '只有作者可以开泄露事故单');
+    if (typeof fragment !== 'string') throw httpError(400, '必须交回泄露片段原文用于核对指纹');
+    return this.store.tx(d => {
+      const doc = d.docs[docId];
+      if (!doc) throw httpError(404, '文档不存在');
+      if (!doc.parentId) throw httpError(400, '事故单只对投放稿生效（泄露只可能记在投放稿的回传上）');
+      this._assertVersion(doc, expectedVersion);
+      const cbs = (d.callbacks && d.callbacks[docId]) || [];
+      const cb = cbs.find(c => c.id === callbackId);
+      if (!cb) throw httpError(404, '这笔回传不存在');
+      const items = (cb.leak && cb.leak.items) || [];
+      if (!Number.isInteger(leakIndex) || leakIndex < 0 || leakIndex >= items.length) {
+        throw httpError(404, '这笔回传上没有这一处泄露');
+      }
+      // 同一处泄露不能开两次
+      if ((doc.incidents || []).some(ic => ic.callbackId === callbackId && ic.leakIndex === leakIndex)) {
+        throw httpError(409, '这处泄露已经开过事故单，不能重复开');
+      }
+      const item = items[leakIndex];
+      // 交回的原文只和账上指纹/字数对一遍：对不上说明指认错了泄露处，拒绝
+      if (cpLen(fragment) !== item.len || sha256Hex(fragment) !== item.sha256) {
+        throw httpError(409, '交回的片段与这笔泄露记存的指纹对不上（字数或内容不一致）');
+      }
+
+      doc.incidents = doc.incidents || [];
+      d.counters.incident = (d.counters.incident || 0) + 1;
+      const id = 'in_' + d.counters.incident;
+      const now = new Date().toISOString();
+      // 泄露行指纹取自登记回传时算好的位置指纹（那里已把 Myers 吞掉的行首/行尾
+      // 字补回、把拼接上下文剥掉）；交回的片段只用于核对指纹，绝不落盘。
+      const locator = item.locator
+        ? JSON.parse(JSON.stringify(item.locator))
+        : { kind: 'unlocatable' };
+      const lines = locator.kind === 'gap'
+        ? locator.lines
+        : codePoints(fragment.replace(/\r\n/g, '\n').replace(/\r/g, '\n'))
+            .join('').split('\n').filter(l => l.length > 0)
+            .map(l => ({ sha256: sha256Hex(l), len: cpLen(l) }));
+      const incident = {
+        id, docId,
+        callbackId, callbackSeq: cb.seq, channel: cb.channel,
+        leakIndex,
+        chars: item.len, sha256: item.sha256,   // 只存字数 + 指纹，绝不存泄露的字
+        locator, lines,
+        at: now, by: actor,
+      };
+      doc.incidents.push(incident);
+      doc.version += 1;
+      doc.updatedAt = now;
+      // 同事务立即抽字：此刻对外快照里对得上这处泄露的位置全部抽空
+      const vacuumed = this._enforceIncidentOnReleases(d, doc, incident, actor);
+      this._event(d, 'incident.opened', actor, docId, {
+        incident: id, callback: callbackId, seq: cb.seq, channel: cb.channel,
+        leak: leakIndex, chars: item.len, vacuumed: vacuumed.length,
+      });
+      return { doc: this._docView(d, doc), incident: this._incidentView(incident), vacuumed };
+    });
+  }
+
+  // 事故单盯住的“段缝”里是否包含某条放行记录（按对外拼接顺序的位置，不看文本）
+  _releaseInGap(doc, locator, releaseId) {
+    const ordered = this._sortedReleases(doc);
+    const iB = locator.before ? ordered.findIndex(r => r.id === locator.before) : -1;
+    const iA = locator.after ? ordered.findIndex(r => r.id === locator.after) : -1;
+    const iR = ordered.findIndex(r => r.id === releaseId);
+    if (iR < 0) return false;
+    const lo = iB >= 0 ? iB : -1;          // before 不存在/失去位置 → 从头算
+    const hi = iA >= 0 ? iA : ordered.length; // after 不存在/失去位置 → 到尾算
+    return iR > lo && iR < hi;
+  }
+
+  // 把一张事故单立即落进现有放行快照：只抽“对得上”的位置。
+  //   - gap：段缝里的放行段，其【某一整行】与泄露的某一行逐字相同（指纹一致）→
+  //     只抽空这一行（单段放行的常见情形即整段抽空）；
+  //   - span / inside / span-multi / unlocatable：外面的字只可能变少（遮罩），
+  //     不可能从这些位置冒出原文，开单不抽字（查账时按指纹/坐标报告现状）。
+  // 按整行指纹匹配、按行抽空，不做任意子串替换——文中别处相同的字不连坐。
+  _enforceIncidentOnReleases(d, doc, incident, actor) {
+    const vacuumed = [];
+    const loc = incident.locator || { kind: 'unlocatable' };
+    if (loc.kind !== 'gap') return vacuumed;
+    const lineSet = new Set(incident.lines.map(l => l.sha256));
+    for (const r of this._sortedReleases(doc)) {
+      if (!this._releaseInGap(doc, loc, r.id)) continue;
+      const { hits, hashes } = this._matchGapLines(this._anchorVisible(r.anchor).split('\n'), lineSet);
+      if (!hits.length) continue;
+      r.incidentScrubs = r.incidentScrubs || [];
+      const erased = this._eraseAnchorVisibleRanges(r, hits);
+      if (erased > 0) {
+        r.incidentScrubs.push({ incident: incident.id, hashes, len: erased, at: incident.at });
+        vacuumed.push({ release: r.id, len: erased });
+        this._event(d, 'release.incident-scrubbed', actor, doc.id,
+          { release: r.id, incident: incident.id, len: erased });
+      }
+    }
+    return vacuumed;
+  }
+
+  // 段内逐行匹配泄露行指纹：返回可见坐标上的命中区间与命中行指纹
+  _matchGapLines(vLines, lineSet) {
+    const hits = [], hashes = [];
+    let off = 0;
+    for (const vl of vLines) {
+      const h = sha256Hex(vl);
+      if (lineSet.has(h)) { hits.push([off, off + cpLen(vl)]); hashes.push(h); }
+      off += cpLen(vl) + 1;
+    }
+    return { hits, hashes };
+  }
+
+  // 新段放行时（releaseParagraph 同事务内调用）：若这条放行落在某张已开事故单盯住
+  // 的段缝里、且其某一整行与泄露行逐字相同，放行快照拍下来后立即抽空对应行——
+  // 事故单一开，对得上的字不能借“新开一段放行”又出现在任何渠道的对外稿里。
+  _enforceIncidentsOnNewRelease(d, doc, release, actor) {
+    const vacuumed = [];
+    const vLines = this._anchorVisible(release.anchor).split('\n');
+    for (const incident of (doc.incidents || [])) {
+      const loc = incident.locator;
+      if (!loc || loc.kind !== 'gap') continue;
+      if (!this._releaseInGap(doc, loc, release.id)) continue;
+      const { hits, hashes } = this._matchGapLines(vLines, new Set(incident.lines.map(l => l.sha256)));
+      if (!hits.length) continue;
+      const erased = this._eraseAnchorVisibleRanges(release, hits);
+      if (erased > 0) {
+        release.incidentScrubs = release.incidentScrubs || [];
+        release.incidentScrubs.push({ incident: incident.id, hashes, len: erased, at: new Date().toISOString() });
+        vacuumed.push({ release: release.id, incident: incident.id, len: erased });
+        this._event(d, 'release.incident-scrubbed', actor, doc.id,
+          { release: release.id, incident: incident.id, len: erased });
+      }
+    }
+    return vacuumed;
+  }
+
+  _incidentView(ic) {
+    return {
+      id: ic.id, callbackId: ic.callbackId, callbackSeq: ic.callbackSeq, channel: ic.channel,
+      leakIndex: ic.leakIndex, chars: ic.chars, sha256: ic.sha256,
+      locator: ic.locator, lines: ic.lines.map(l => ({ len: l.len })),
+      by: ic.by, at: ic.at,
+    };
+  }
+
+  // 在一段【可见文本】里按指纹查泄露片段是否逐字出现（只存指纹的账上查字用）。
+  // 滑窗按片段字数比较 code-point 子串的 SHA-256，不还原泄露原文。
+  _visibleContainsHash(visible, hash, len) {
+    if (!len || cpLen(visible) < len) return false;
+    const chars = codePoints(visible);
+    for (let i = 0; i + len <= chars.length; i++) {
+      if (sha256Hex(chars.slice(i, i + len).join('')) === hash) return true;
+    }
+    return false;
+  }
+
+  // 某张事故单对某渠道此刻的对外 parts：这处泄露的字还看不看得到。
+  // 返回状态：
+  //   visible    这处泄露的字此刻在该渠道对外稿里逐字对得上（事故没盖住/盖住的是别处）；
+  //   masked     对应位置还在，但字已经被遮罩/事故抽空（只剩 █，原文翻不出来）；
+  //   absent     这段根本不在该渠道视图里（未放行 / 已被该渠道召回）；
+  //   unvisible  对不上（位置指纹无法把泄露字对应到任何可见字；外部没有这处字）。
+  _incidentChannelStatus(doc, ic, parts) {
+    const byId = new Map(parts.map(p => [p.release, p]));
+    const loc = ic.locator || { kind: 'unlocatable' };
+    const visibleAll = parts.map(p => p.text).join('\n');
+
+    if (loc.kind === 'gap') {
+      // 逐行判定：这行落在哪条放行段上（开单时抽过空的有 incidentScrubs 记录）
+      const states = ic.lines.map(line => {
+        let matched = null;
+        for (const r of this._sortedReleases(doc)) {
+          if (!this._releaseInGap(doc, loc, r.id)) continue;
+          if (!r.incidentScrubs) continue;
+          const scrubbed = r.incidentScrubs.some(s => s.incident === ic.id && (s.hashes || [s.hash]).includes(line.sha256));
+          if (scrubbed) { matched = r; break; }
+        }
+        if (matched) {
+          // 被事故抽空的段：在视图里 → masked；被该渠道召回/未放行 → absent
+          return byId.has(matched.id) ? 'masked' : 'absent';
+        }
+        // 还没落到任何放行段：查当前缝里各段有没有逐字相同的
+        for (const p of parts) {
+          if (!this._releaseInGap(doc, loc, p.release)) continue;
+          if (cpLen(p.text) === line.len && sha256Hex(p.text) === line.sha256) return 'visible';
+        }
+        return 'unvisible';
+      });
+      return this._mergeLineStates(states);
+    }
+
+    if (loc.kind === 'span') {
+      const p = byId.get(loc.release);
+      if (!p) return 'absent';
+      const chars = codePoints(p.text);
+      const slice = chars.slice(loc.start, Math.min(loc.end, chars.length)).join('');
+      if (cpLen(slice) === ic.chars && sha256Hex(slice) === ic.sha256) return 'visible';
+      if (slice.length > 0 && /^█+$/.test(slice)) return 'masked';
+      return this._visibleContainsHash(visibleAll, ic.sha256, ic.chars) ? 'visible' : 'unvisible';
+    }
+
+    if (loc.kind === 'inside') {
+      const p = byId.get(loc.release);
+      if (!p) return 'absent';
+      if (this._visibleContainsHash(p.text, ic.sha256, ic.chars)) return 'visible';
+      return 'unvisible';
+    }
+
+    // span-multi / unlocatable（老账）：只在整篇可见文本里按整串指纹查
+    return this._visibleContainsHash(visibleAll, ic.sha256, ic.chars) ? 'visible' : 'unvisible';
+  }
+
+  // 多行泄露：各行状态合并为这处泄露在该渠道的总状态（只要还有一个字在外就能读到）
+  _mergeLineStates(states) {
+    if (states.includes('visible')) return 'visible';
+    if (states.some(s => s === 'unvisible' || s === 'masked' || s === 'absent')) {
+      if (states.every(s => s === 'absent')) return 'absent';
+      if (states.includes('unvisible')) return 'unvisible';
+      return 'masked';
+    }
+    return 'absent';
+  }
+
+  // 查这份开过哪些事故单、各对着哪处泄露、现在各渠道的对外稿还看不看得到那处字。
+  // 可带 callback= / channel= 过滤（登录可读，审阅人只读）。
+  async incidentLedger(docId, filter) {
+    return this.store.read(d => {
+      const doc = d.docs[docId];
+      if (!doc) throw httpError(404, '文档不存在');
+      const f = filter || {};
+      let ics = (doc.incidents || []).map(ic => this._incidentView(ic));
+      if (f.callback) ics = ics.filter(ic => ic.callbackId === f.callback);
+      if (f.incident) ics = ics.filter(ic => ic.id === f.incident);
+
+      // 渠道集合：召回令、回传账上出现过的渠道，外加公开口径（null）
+      const channelSet = new Set();
+      for (const o of (doc.recalls || [])) channelSet.add(o.channel);
+      for (const c of ((d.callbacks && d.callbacks[docId]) || [])) channelSet.add(c.channel);
+      let channels = [...channelSet].sort();
+      if (f.channel) {
+        channels = channels.filter(ch => ch === f.channel);
+        if (!channels.length) channels = [f.channel];
+      }
+      const views = new Map();
+      const ensureParts = ch => {
+        if (!views.has(ch)) views.set(ch, this._externalParts(d, doc, ch));
+        return views.get(ch);
+      };
+      ensureParts(null);
+      for (const ch of channelSet) ensureParts(ch);
+
+      const incidents = ics.map(v => {
+        const full = (doc.incidents || []).find(ic => ic.id === v.id);
+        const channelStatus = [{ channel: null, status: this._incidentChannelStatus(doc, full, ensureParts(null)) }];
+        for (const ch of channelSet) {
+          if (f.channel && ch !== f.channel) continue;
+          channelStatus.push({ channel: ch, status: this._incidentChannelStatus(doc, full, ensureParts(ch)) });
+        }
+        const visible = channelStatus.some(x => x.status === 'visible');
+        return { ...v, visible, channels: channelStatus };
+      });
+      return {
+        docId,
+        channel: f.channel || null,
+        count: incidents.length,
+        incidents,
+      };
+    });
   }
 
   // ---------- 批注查询 ----------
@@ -1278,6 +1730,7 @@ class Service {
       paragraphs: paragraphBounds(doc.content).map(([start, end]) => ({ start, end })),
       releases: (doc.releases || []).map(r => this._releaseView(r)),
       recalls: (doc.recalls || []).map(o => this._recallView(o)),
+      incidents: (doc.incidents || []).map(ic => this._incidentView(ic)),
       callbacks: cbList.length,
       callbackSummary: doc.parentId ? this._callbackSummary(cbList.map(c => this._callbackView(c))) : [],
       parent: parent ? { id: parent.id, title: parent.title } : null,

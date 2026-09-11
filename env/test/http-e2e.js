@@ -416,6 +416,95 @@ async function nodBoth(docId, start, end, version) {
     // 文档视图带召回令
     ok('文档视图带召回令', (await req('author', 'GET', `/api/docs/${rcKid}`)).body.recalls.length === 2);
 
+    console.log('G) 泄露事故单（作者对已记泄露开单；任何渠道对得上的字抽空；不可改撤/重复）');
+    const inText = '事故首段甲。\n事故二段乙。\n事故三段丙。';
+    const inMc = await req('author', 'POST', '/api/docs', { title: '事故母稿', content: inText });
+    const inMid = inMc.body.id;
+    const inKid = (await req('author', 'POST', `/api/docs/${inMid}/derive`, { title: '事故投放稿' })).body.id;
+    // 放行第一、三段，第二段未放行
+    await req('author', 'POST', `/api/docs/${inKid}/release`, { paragraph: 0 });
+    await req('author', 'POST', `/api/docs/${inKid}/release`, { paragraph: 2 });
+    const inExtBefore = (await req(null, 'GET', `/api/docs/${inKid}/external`)).body;
+    ok('开单前外面只有一、三段', inExtBefore.content === '事故首段甲。\n事故三段丙。');
+
+    // 门槛：未登录/审阅人不能开；母稿不能开
+    ok('未登录不能开事故单', (await req(null, 'POST', `/api/docs/${inKid}/incidents`,
+      { callbackId: 'cb_x', leakIndex: 0, fragment: 'x' })).status === 401);
+    ok('审阅人不能开事故单', (await req('reviewer', 'POST', `/api/docs/${inKid}/incidents`,
+      { callbackId: 'cb_x', leakIndex: 0, fragment: 'x' })).status === 403);
+    ok('母稿不能开事故单', (await req('author', 'POST', `/api/docs/${inMid}/incidents`,
+      { callbackId: 'cb_x', leakIndex: 0, fragment: 'x' })).status === 400);
+
+    // 渠道甲夹带第二段回传 → 泄露
+    const inCb = await req('author', 'POST', `/api/docs/${inKid}/callbacks`,
+      { channel: '渠道甲', content: inText });
+    ok('夹带未放行段：泄露', inCb.body.callback.leak.count === 1
+      && JSON.stringify(inCb.body.leakFragments).includes('二段乙'));
+    const inCbId = inCb.body.callback.id;
+    const inFrag = inCb.body.leakFragments[0];
+    // 不存在的回传/越界泄露号/指纹对不上
+    ok('不存在的回传 404', (await req('author', 'POST', `/api/docs/${inKid}/incidents`,
+      { callbackId: 'cb_999', leakIndex: 0, fragment: inFrag })).status === 404);
+    ok('泄露号越界 404', (await req('author', 'POST', `/api/docs/${inKid}/incidents`,
+      { callbackId: inCbId, leakIndex: 9, fragment: inFrag })).status === 404);
+    ok('片段指纹对不上 409', (await req('author', 'POST', `/api/docs/${inKid}/incidents`,
+      { callbackId: inCbId, leakIndex: 0, fragment: '随便几个字' })).status === 409);
+
+    // 开单（缝里还空着，当场不抽字）
+    const opened = await req('author', 'POST', `/api/docs/${inKid}/incidents`,
+      { callbackId: inCbId, leakIndex: 0, fragment: inFrag });
+    ok('事故单 201', opened.status === 201 && opened.body.incident.id.startsWith('in_')
+      && opened.body.incident.channel === '渠道甲' && opened.body.vacuumed.length === 0);
+    // 同一处不能开两次
+    ok('同一处泄露不能开两次', (await req('author', 'POST', `/api/docs/${inKid}/incidents`,
+      { callbackId: inCbId, leakIndex: 0, fragment: inFrag })).status === 409);
+
+    // 放行第二段：事故单盯住段缝，立即抽空
+    await req('author', 'POST', `/api/docs/${inKid}/release`, { paragraph: 1 });
+    const inPub = (await req(null, 'GET', `/api/docs/${inKid}/external`)).body;
+    ok('公开口径对得上的字抽空', inPub.content === '事故首段甲。\n██████\n事故三段丙。'
+      && !inPub.content.includes('事故二段乙'));
+    const inA = (await req(null, 'GET', `/api/docs/${inKid}/external?channel=${encodeURIComponent('渠道甲')}`)).body;
+    const inB = (await req(null, 'GET', `/api/docs/${inKid}/external?channel=${encodeURIComponent('渠道乙')}`)).body;
+    ok('任何渠道都翻不出原文', !inA.content.includes('事故二段乙') && !inB.content.includes('事故二段乙'));
+    ok('对不上的字不跟着抽', inPub.content.includes('事故首段甲') && inPub.content.includes('事故三段丙'));
+    // 内部正文不动
+    ok('事故不改正文', (await req('author', 'GET', `/api/docs/${inKid}`)).body.content.includes('事故二段乙'));
+
+    // 查账：开过哪些事故、对着哪些泄露、各渠道看不看得到
+    const ledger = (await req('reviewer', 'GET', `/api/docs/${inKid}/incidents`)).body;
+    ok('审阅人也能查事故账', ledger.count === 1
+      && ledger.incidents[0].callbackId === inCbId
+      && ledger.incidents[0].channels.some(c => c.channel === null && c.status === 'masked')
+      && ledger.incidents[0].visible === false);
+    ok('按渠道过滤事故账', (await req('author', 'GET',
+      `/api/docs/${inKid}/incidents?channel=${encodeURIComponent('渠道甲')}`)).body.incidents[0]
+      .channels.some(c => c.channel === '渠道甲'));
+
+    // 被召回渠道泄露 → 公开口径也抽（另起一份：四段，召回第二段后全量送回）
+    const icText = '连坐首段。\n连坐二段。\n连坐三段。\n连坐四段。';
+    const icMc = await req('author', 'POST', '/api/docs', { title: '连坐母稿', content: icText });
+    const icKid = (await req('author', 'POST', `/api/docs/${icMc.body.id}/derive`, { title: '连坐投放稿' })).body.id;
+    for (const p of [0, 1, 2, 3]) await req('author', 'POST', `/api/docs/${icKid}/release`, { paragraph: p });
+    await req('author', 'POST', `/api/docs/${icKid}/recalls`, { channel: '渠道甲', paragraphs: [1] });
+    const icCb = await req('author', 'POST', `/api/docs/${icKid}/callbacks`,
+      { channel: '渠道甲', content: icText });
+    ok('被召回段送回：泄露+拒不召回', icCb.body.callback.refusals.length === 1
+      && icCb.body.callback.leak.count >= 1);
+    const icRec = (await req('author', 'GET',
+      `/api/docs/${icKid}/callbacks?channel=${encodeURIComponent('渠道甲')}`)).body.callbacks[0];
+    const gapIdx = icRec.leak.items.findIndex(it => it.locator && it.locator.kind === 'gap');
+    const opened2 = await req('author', 'POST', `/api/docs/${icKid}/incidents`,
+      { callbackId: icRec.id, leakIndex: gapIdx, fragment: icCb.body.leakFragments[gapIdx] });
+    ok('第二张事故单 201', opened2.status === 201 && opened2.body.vacuumed.length === 1);
+    const icPub = (await req(null, 'GET', `/api/docs/${icKid}/external`)).body;
+    ok('被召回渠道泄露：公开口径也抽空',
+      !icPub.content.includes('连坐二段') && icPub.content.includes('连坐首段') && icPub.content.includes('连坐四段'));
+
+    // 没有改/撤事故单的接口（PUT/DELETE 不存在 → 404）
+    ok('没有撤销事故单的接口', (await req('author', 'DELETE',
+      `/api/docs/${inKid}/incidents/${opened.body.incident.id}`)).status === 404);
+
     console.log(`\nHTTP 端到端全部通过：${passed} 项`);
   } finally {
     srv.kill();

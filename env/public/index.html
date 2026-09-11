@@ -141,8 +141,15 @@
           <div id="callbackSummary"></div>
           <div id="callbackList"></div>
         </div>
+        <div class="card hidden" id="incidentCard">
+          <h3>泄露事故单</h3>
+          <p class="hint">作者可对<b>某一笔已经记下泄露的回传、其中某一处泄露</b>开事故单（写明哪份投放稿、哪笔回传、哪处泄露，
+            并交回登记回传时见过一次的泄露片段用于核对指纹）。单据一开<b>不能改、不能撤、同一处不能开两次</b>。
+            开出后，任何渠道（含公开口径）再看这份，对外稿里<b>对得上这处泄露的字必须抽空</b>成 █、原文翻不出来；
+            对不上的字不跟着抽。事故不改正文、也不复活已抹掉的字。</p>
+          <div id="incidentList"></div>
+        </div>
         <div class="card">
-          <h3>历史</h3>
           <div id="eventList" class="events"></div>
         </div>
       </aside>
@@ -171,6 +178,18 @@
       <div id="maskChecks"></div>
       <div class="row right">
         <button id="maskModalCancel" class="primary">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 开泄露事故单弹层 -->
+  <div id="incidentModal" class="modal hidden">
+    <div class="modal-box card">
+      <h3>开泄露事故单</h3>
+      <div id="incidentModalBody"></div>
+      <div class="row right">
+        <button id="incidentModalCancel">取消</button>
+        <button id="incidentModalOk" class="primary danger">开单（不可改、不可撤）</button>
       </div>
     </div>
   </div>

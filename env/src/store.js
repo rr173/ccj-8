@@ -15,7 +15,7 @@ class JsonStore {
       users: {},          // username -> {passHash, role}
       docs: {},           // id -> document
       callbacks: {},      // docId -> [回传记账（只追加、永不修改/删除）]
-      counters: { doc: 0, ann: 0, event: 0, release: 0, callback: 0, recall: 0 }
+      counters: { doc: 0, ann: 0, event: 0, release: 0, callback: 0, recall: 0, incident: 0 }
     };
     this._load();
   }

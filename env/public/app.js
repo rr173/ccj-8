@@ -12,6 +12,7 @@ const state = {
   events: [],
   callbacks: null,
   recalls: null,
+  incidents: null,
   selection: null,       // {start,end,text}（content 坐标）
   repositionId: null,   // 正在重新定位的批注
   pollTimer: null,
@@ -208,13 +209,14 @@ async function reloadDoc(opts = {}) {
       ];
     });
     // 渠道回传账与召回账只对投放稿查询
-    let callbacks = null, recalls = null;
+    let callbacks = null, recalls = null, incidents = null;
     if (doc.parentId) {
       try { callbacks = await api('GET', `/api/docs/${id}/callbacks`); } catch { callbacks = { callbacks: [], summary: [] }; }
       try { recalls = await api('GET', `/api/docs/${id}/recalls`); } catch { recalls = { orders: [], channels: [] }; }
+      try { incidents = await api('GET', `/api/docs/${id}/incidents`); } catch { incidents = { incidents: [] }; }
     }
     state.doc = doc; state.annotations = annotations; state.events = events;
-    state.callbacks = callbacks; state.recalls = recalls;
+    state.callbacks = callbacks; state.recalls = recalls; state.incidents = incidents;
     renderDoc(opts);
   } catch (e) {
     if (!opts.silent) toast(e.message);
@@ -247,6 +249,7 @@ function renderDoc(opts = {}) {
   renderMaskCard();
   renderReleaseCard();
   renderCallbackCard();
+  renderIncidentCard();
   renderEvents();
   const isAuthor = state.me.role === 'author';
   const frozen = doc.status !== 'open';
@@ -746,6 +749,14 @@ function renderCallbackCard() {
          refuse ? '<span class="badge rejected">拒不召回</span>' : ''].join(' ');
     const detail = leak
       ? `<div class="hint">回传里有 ${c.leak.count} 处、${c.leak.chars} 字是外面看不见的（已记指纹，不显示/不落原字）。</div>` : '';
+    // 每处泄露是否已开过事故单（同一处不能开两次）
+    const openedSet = new Set((state.incidents?.incidents || [])
+      .map(ic => ic.callbackId + '#' + ic.leakIndex));
+    const leakActions = leak && isAuthor
+      ? [...Array(c.leak.count).keys()].map(i => openedSet.has(c.id + '#' + i)
+        ? `<span class="badge accepted">第 ${i + 1} 处已开事故单</span>`
+        : `<button class="danger act-incident" data-cb="${c.id}" data-i="${i}">对第 ${i + 1} 处泄露开事故单</button>`
+        ).join(' ') : '';
     const missDetail = miss
       ? `<div class="hint">少发第 ${c.missing.map(m => m.index + 1).join('、')} 段（共 ${c.missing.reduce((a, m) => a + m.len, 0)} 字）。</div>` : '';
     const refuseDetail = refuse
@@ -755,9 +766,79 @@ function renderCallbackCard() {
         <span>第 ${c.seq} 次</span><span>${esc(c.by)} · ${fmtTime(c.at)}</span></div>
       <div class="hint">回传 ${c.chars} 字 · 该渠道此刻外面 ${c.externalLen} 字</div>
       ${detail}${missDetail}${refuseDetail}
+      ${leakActions ? `<div class="row">${leakActions}</div>` : ''}
+    </div>`;
+  }).join('');
+  host.querySelectorAll('.act-incident').forEach(btn => {
+    btn.onclick = () => openIncidentModal(btn.dataset.cb, Number(btn.dataset.i));
+  });
+}
+
+// ---------- 泄露事故单 ----------
+const INCIDENT_STATUS = {
+  visible: ['还看得到（泄露字仍在对外稿里）', 'rejected'],
+  masked: ['已抽空（该处只剩 █，原文翻不出来）', 'accepted'],
+  absent: ['该渠道看不到这段（未放行/已召回）', 'proposed'],
+  unvisible: ['对不上（外部没有这处字）', 'accepted'],
+};
+
+function renderIncidentCard() {
+  const card = $('#incidentCard');
+  if (!state.doc.parentId) { card.classList.add('hidden'); return; }
+  card.classList.remove('hidden');
+  const host = $('#incidentList');
+  const list = (state.incidents && state.incidents.incidents) || [];
+  if (!list.length) { host.innerHTML = '<p class="hint">还没有开过泄露事故单。在下面回传账里对某笔泄露点“开事故单”。</p>'; return; }
+  host.innerHTML = list.slice().reverse().map(ic => {
+    const locText = {
+      gap: '段缝（未放行/后放行的整段）',
+      span: '已可见段内固定位置',
+      inside: '段内插入的字（只能指纹查证）',
+      'span-multi': '跨段位置（指纹查证）',
+      unlocatable: '旧账位置（指纹查证）',
+    }[ic.locator && ic.locator.kind] || '位置指纹';
+    const chans = (ic.channels || []).map(c => {
+      const [text, cls] = INCIDENT_STATUS[c.status] || [c.status, 'proposed'];
+      const name = c.channel === null ? '公开口径' : c.channel;
+      return `<span class="badge ${cls}" title="${esc(name)}：${text}">${esc(name)}·${esc(text.split('（')[0])}</span>`;
+    }).join(' ');
+    return `<div class="cb-item ${ic.visible ? 'bad' : 'ok'}">
+      <div class="meta"><b>${esc(ic.id)}</b><span>渠道「${esc(ic.channel)}」第 ${ic.callbackSeq} 次回传 · 第 ${ic.leakIndex + 1} 处泄露</span></div>
+      <div class="hint">泄露 ${ic.chars} 字 · 位置：${locText} · ${esc(ic.by)} · ${fmtTime(ic.at)}</div>
+      <div class="row">${chans}</div>
+      <div class="hint">事故单一开不可改、不可撤；指纹 <code>${esc(ic.sha256.slice(0, 12))}…</code></div>
     </div>`;
   }).join('');
 }
+
+// 开事故单弹层：必须交回登记回传时见过一次的泄露片段（与账上指纹核对）
+async function openIncidentModal(callbackId, leakIndex) {
+  const rec = ((state.callbacks && state.callbacks.callbacks) || []).find(c => c.id === callbackId);
+  if (!rec) return;
+  $('#incidentModalBody').innerHTML = `
+    <p class="hint">对 <b>渠道「${esc(rec.channel)}」第 ${rec.seq} 次回传的第 ${leakIndex + 1} 处泄露</b> 开事故单。</p>
+    <p class="hint">请把登记这笔回传时系统返回过一次的<b>原始泄露片段</b>粘贴到下面（系统只与账上 SHA-256 指纹/字数核对，不落盘）。
+      核对一致才会开单；开出后任何渠道的对外稿里，对得上这处泄露的字立即抽空成 █。</p>
+    <textarea id="incFrag" rows="4" placeholder="粘贴该处泄露的原始片段…"></textarea>
+    <p class="error" id="incMsg"></p>`;
+  $('#incidentModal').classList.remove('hidden');
+  $('#incidentModalOk').onclick = async () => {
+    const fragment = $('#incFrag').value;
+    try {
+      const r = await api('POST', `/api/docs/${state.doc.id}/incidents`, {
+        callbackId, leakIndex, fragment, version: state.doc.version,
+      });
+      $('#incidentModal').classList.add('hidden');
+      const n = (r.vacuumed || []).length;
+      toast(`事故单已开（不可改、不可撤）${n ? `；已抽空 ${n} 处对外快照` : '；该处一旦放行会自动抽空'}`);
+      await reloadDoc();
+    } catch (e) {
+      if (e.status === 409) { $('#incMsg').textContent = e.message; await reloadDoc(); }
+      else $('#incMsg').textContent = e.message;
+    }
+  };
+}
+$('#incidentModalCancel').onclick = () => $('#incidentModal').classList.add('hidden');
 
 $('#cbSubmit').onclick = async () => {
   $('#cbMsg').textContent = '';
@@ -912,6 +993,8 @@ const EVENT_TEXT = {
     return `渠道「${d.channel}」第 ${d.seq} 次回传：${parts.join('、')}（已记账，不可抹）`;
   },
   'review.closed': '审阅结束，对外稿冻结',
+  'incident.opened': d => `开出泄露事故单（渠道「${d.channel}」第 ${d.seq} 次回传第 ${d.leak + 1} 处泄露，${d.chars} 字）：不可改、不可撤；当场抽空对外快照 ${d.vacuumed} 处，以后对得上的字一律抽空`,
+  'release.incident-scrubbed': d => `事故单追加生效：放行快照抽空 ${d.len} 字（对得上泄露处的字，任何渠道都翻不出原文）`,
 };
 function kindName(k) { return k === 'mask' ? '遮罩提议' : k === 'suggest' ? '修改建议' : '批注'; }
 function renderEvents() {

@@ -172,6 +172,30 @@ app.get('/api/docs/:id/callbacks', requireAuth(), async (req, res, next) => {
   catch (e) { next(e); }
 });
 
+// 泄露事故单（仅作者开单）：对某份投放稿、某一笔已记泄露的回传、其中某一处泄露开单。
+// 必须交回登记时见过一次的泄露片段（与账上指纹/字数核对，不落盘）；单据只追加、
+// 不可改、不可撤、同一处泄露不能开两次；开出后任何渠道对外稿里对得上的字立即抽空。
+app.post('/api/docs/:id/incidents', requireAuth(['author']), async (req, res, next) => {
+  try {
+    const r = await service.openIncident(
+      req.params.id,
+      String((req.body && req.body.callbackId) || ''),
+      Number(req.body && req.body.leakIndex),
+      String((req.body && req.body.fragment) ?? ''),
+      req.user.name, req.body && req.body.version);
+    res.status(201).json(r);
+  } catch (e) { next(e); }
+});
+
+// 查这份开过哪些事故单、对着哪些泄露、现在各渠道的对外稿还看不看得到那处字
+app.get('/api/docs/:id/incidents', requireAuth(), async (req, res, next) => {
+  try {
+    res.json(await service.incidentLedger(req.params.id, {
+      channel: req.query.channel, callback: req.query.callback, incident: req.query.incident,
+    }));
+  } catch (e) { next(e); }
+});
+
 app.get('/api/docs/:id/events', requireAuth(), async (req, res, next) => {
   try { res.json(await service.events(req.params.id)); }
   catch (e) { next(e); }
