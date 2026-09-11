@@ -133,6 +133,23 @@ app.get('/api/docs/:id/external', async (req, res, next) => {
   catch (e) { next(e); }
 });
 
+// 渠道回传（仅作者登记）：渠道把实际发出去的字回传，必须写明渠道；
+// 与这一份此刻外面能看见的字对账，泄露/少发各记一笔（只追加、不可改、不可抹）。
+// 泄露的原文不按正文落盘（只存字数 + SHA-256 指纹），原始片段仅随本次响应返回。
+app.post('/api/docs/:id/callbacks', requireAuth(['author']), async (req, res, next) => {
+  try {
+    const r = await service.registerCallback(
+      req.params.id, req.body && req.body.channel, String((req.body && req.body.content) ?? ''), req.user.name);
+    res.status(201).json(r);
+  } catch (e) { next(e); }
+});
+
+// 查询某一份的回传账：回过几次、每笔有没有泄露/少发；?channel= 只看某个渠道
+app.get('/api/docs/:id/callbacks', requireAuth(), async (req, res, next) => {
+  try { res.json(await service.callbacks(req.params.id, req.query.channel)); }
+  catch (e) { next(e); }
+});
+
 app.get('/api/docs/:id/events', requireAuth(), async (req, res, next) => {
   try { res.json(await service.events(req.params.id)); }
   catch (e) { next(e); }

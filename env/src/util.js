@@ -383,9 +383,12 @@ function unsign(token, secret) {
 }
 function randomToken() { return crypto.randomBytes(24).toString('hex'); }
 
+// 渠道回传里“泄露的字”不允许落盘，但要留可核对的指纹：只存 SHA-256，不存字。
+function sha256Hex(s) { return crypto.createHash('sha256').update(s, 'utf8').digest('hex'); }
+
 module.exports = {
   codePoints, diffOpcodes, mapRange, mapRangeLoose, contentOpcodes,
   MARK, MARK_END, maskBlock, extractMasks, tokenize, validateAuthorEdit, cpLen,
   mergeParagraphs, mergeTokens, paragraphBounds,
-  hashPassword, verifyPassword, sign, unsign, randomToken,
+  hashPassword, verifyPassword, sign, unsign, randomToken, sha256Hex,
 };

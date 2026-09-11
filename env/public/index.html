@@ -122,6 +122,20 @@
             放行只增不删、不可收回，之后母稿或本稿新增的遮罩会继续追加生效。各投放稿各自独立放行。</p>
           <div id="releaseList"></div>
         </div>
+        <div class="card hidden" id="callbackCard">
+          <h3>渠道回传对账</h3>
+          <p class="hint">渠道把<b>实际发出去的字</b>回传，必须写明渠道、对着这一份。系统拿它跟这一份<b>此刻外面能看见的字</b>对：
+            逐字一致才算干净；出现外面已看不见的字（未放行/已遮罩）记<b>泄露</b>；少了整段已可见的字记<b>少发</b>。
+            每笔只追加、不能改，再回传也抹不掉旧账。</p>
+          <div class="cb-form">
+            <input id="cbChannel" maxlength="100" placeholder="渠道名（如：渠道甲）">
+            <textarea id="cbContent" rows="4" placeholder="粘贴该渠道实际发出去的字…"></textarea>
+            <button id="cbSubmit" class="primary">登记这笔回传</button>
+            <span id="cbMsg" class="error"></span>
+          </div>
+          <div id="callbackSummary"></div>
+          <div id="callbackList"></div>
+        </div>
         <div class="card">
           <h3>历史</h3>
           <div id="eventList" class="events"></div>

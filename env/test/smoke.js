@@ -7,6 +7,7 @@ const assert = require('assert');
 const { JsonStore } = require('../src/store');
 const { Service } = require('../src/domain');
 const util = require('../src/util');
+const { cpLen } = util;
 
 let passed = 0;
 function ok(name, cond) { assert.ok(cond, name); console.log('  ✓', name); passed++; }
@@ -534,6 +535,95 @@ async function main() {
   await svc.repositionAnnotation(mE.id, cc.id, bing, bing + 1, R2, eCur.version);
   ccView = (await svc.annotations(mE.id)).find(a => a.id === cc.id);
   ok('普通批注可由审阅人重新定位', ccView.status === 'proposed' && ccView.covered === '乙');
+
+  console.log('26) 渠道回传记账：对着投放稿、写明渠道，跟此刻外面能看见的字对');
+  const cbText = '首段公开文字甲。\n二段含代号RUBY三。\n三段联系方式见官网。';
+  const cbMaster = await svc.createDoc('回传母稿', cbText, 'author');
+  const cbDoc = await svc.deriveDoc(cbMaster.id, '回传投放稿', 'author');
+  // 还没放行任何段：外面什么字都看不见，不收任何渠道回传
+  const errGate = await svc.registerCallback(cbDoc.id, '渠道甲', cbText, 'author').then(() => null, e => e);
+  ok('外面还看不见字：不收回传', errGate && errGate.status === 409);
+  // 只能对投放稿、只能由作者登记
+  const errMasterCb = await svc.registerCallback(cbMaster.id, '渠道甲', cbText, 'author').then(() => null, e => e);
+  ok('母稿不收回传', errMasterCb && errMasterCb.status === 400);
+  const errNoChan = await svc.registerCallback(cbDoc.id, '   ', cbText, 'author').then(() => null, e => e);
+  ok('必须写明渠道', errNoChan && errNoChan.status === 400);
+  const errReviewerCb = await svc.registerCallback(cbDoc.id, '渠道甲', cbText, 'reviewer').then(() => null, e => e);
+  ok('审阅人不能登记回传', errReviewerCb && errReviewerCb.status === 403);
+
+  // 放行前两段：外面只能看到这两段（此刻都还没遮罩）
+  await svc.releaseParagraph(cbDoc.id, 0, 'author', (await svc.getDoc(cbDoc.id)).version);
+  await svc.releaseParagraph(cbDoc.id, 1, 'author', (await svc.getDoc(cbDoc.id)).version);
+  let cbExt = await svc.external(cbDoc.id);
+  ok('外面此刻只看得见前两段', cbExt.content === '首段公开文字甲。\n二段含代号RUBY三。');
+
+  // (a) 渠道甲实际发出去的字 = 外面此刻看得见的字（逐字一致）→ 干净
+  const clean = await svc.registerCallback(cbDoc.id, '渠道甲', cbExt.content, 'author');
+  ok('逐字对得上：干净', clean.callback.clean === true
+    && clean.callback.leak.count === 0 && clean.callback.missing.length === 0);
+  ok('干净笔不回传泄露片段', clean.leakFragments.length === 0);
+  ok('记账带回传序号（该渠道第 1 次）', clean.callback.seq === 1 && clean.callback.channel === '渠道甲');
+
+  // (b) 渠道乙把外面还看不见的第三段也发出去了 → 整段泄露 + 不算少发
+  const leakWhole = await svc.registerCallback(cbDoc.id, '渠道乙', cbText, 'author');
+  ok('发出外面看不见的整段：泄露', leakWhole.callback.clean === false
+    && leakWhole.callback.leak.count >= 1 && leakWhole.callback.leak.chars === cpLen('\n三段联系方式见官网。'));
+  ok('整段在场（只是外面没有）：不计少发', leakWhole.callback.missing.length === 0);
+  ok('本次响应能看到泄露的字（给记账人核对）', leakWhole.leakFragments.join('').includes('联系方式见官网'));
+
+  // (c) 渠道乙再回传：外面看得见的两段全缺，第三段照发 → 前两段少发 + 第三段泄露
+  const second = await svc.registerCallback(cbDoc.id, '渠道乙', '三段联系方式见官网。', 'author');
+  ok('第二次回传单独记账（seq=2）', second.callback.seq === 2);
+  ok('缺了两段已能看见的字：记两笔少发', second.callback.missing.length === 2
+    && second.callback.missing.map(m => m.index).join(',') === '0,1');
+  ok('第三段仍泄露', second.leakFragments.join('').includes('联系方式见官网') && second.callback.leak.chars > 0);
+
+  // (d) 母稿确认遮掉 RUBY：外面（含放行快照）从此读不到；渠道回传里还带着它 → 泄露
+  const cbMDoc = await svc.getDoc(cbMaster.id);
+  const rubyPos = cpIndexOf(cbMDoc.content, 'RUBY');
+  await nodBoth(cbMaster.id, rubyPos, rubyPos + 4, cbMDoc.version);
+  cbExt = await svc.external(cbDoc.id);
+  ok('遮罩后外面读不到 RUBY', !cbExt.content.includes('RUBY') && cbExt.content.includes('████'));
+  const leaked = await svc.registerCallback(cbDoc.id, '渠道甲',
+    '首段公开文字甲。\n二段含代号RUBY三。', 'author');
+  ok('回传出现外面已看不见的字 RUBY：泄露', leaked.callback.clean === false
+    && leaked.leakFragments.join('').includes('RUBY'));
+  ok('两段都在场：不计少发', leaked.callback.missing.length === 0);
+  const rawCb = fs.readFileSync(path.join(tmp, 'data.json'), 'utf8');
+  ok('泄露的字不落盘（数据文件搜不到 RUBY）', !rawCb.includes('RUBY'));
+  ok('落盘只留泄露片段指纹（SHA-256）与字数', JSON.parse(rawCb).callbacks[cbDoc.id]
+    .some(c => c.leak.items.some(it => /^[0-9a-f]{64}$/.test(it.sha256) && it.len === 4)));
+
+  // (e) 旧泄露不能靠再回传一次抹掉：渠道甲上一笔泄露仍在，本次干净也只是新的一笔
+  const cleanAgain = await svc.registerCallback(cbDoc.id, '渠道甲', cbExt.content, 'author');
+  ok('改干净后再回传：本笔干净', cleanAgain.callback.clean === true && cleanAgain.callback.seq === 3);
+  const chanA = await svc.callbacks(cbDoc.id, '渠道甲');
+  ok('该渠道回过 3 次，历史泄露笔数仍在（不可抹）', chanA.count === 3
+    && chanA.summary[0].leakCallbacks === 1 && chanA.summary[0].leakChars > 0);
+  const chanB = await svc.callbacks(cbDoc.id, '渠道乙');
+  ok('渠道乙回过 2 次，两笔都有问题', chanB.count === 2
+    && chanB.summary[0].leakCallbacks === 2 && chanB.summary[0].missingCallbacks === 1);
+  const allCb = await svc.callbacks(cbDoc.id);
+  ok('不按渠道查：能查全部回传与分渠道汇总', allCb.count === 5 && allCb.summary.length === 2);
+  const errNoSuchChan = await svc.callbacks(cbDoc.id, '不存在渠道').then(() => null, e => e);
+  ok('没回过的渠道查询返回 404', errNoSuchChan && errNoSuchChan.status === 404);
+
+  // (f) 回传不改内部正文、不动版本、不复活被遮的字；段内缺字算对不上（泄露），不算少发
+  const beforeCbView = await svc.getDoc(cbDoc.id);
+  const beforeCbContent = beforeCbView.content;
+  await svc.registerCallback(cbDoc.id, '渠道丙',
+    cbExt.content.replace('代号', 'XX'), 'author');
+  const afterCbView = await svc.getDoc(cbDoc.id);
+  ok('回传不改内部正文', afterCbView.content === beforeCbContent);
+  ok('回传不推进文档版本', afterCbView.version === beforeCbView.version);
+  ok('内部被遮字没有被救回来', !afterCbView.content.includes('RUBY'));
+  const docCbStats = await svc.getDoc(cbDoc.id);
+  ok('文档视图带回传笔数与分渠道汇总', docCbStats.callbacks === 6
+    && docCbStats.callbackSummary.some(s => s.channel === '渠道丙'));
+  const cbEvents = await svc.events(cbDoc.id);
+  ok('回传事件只记渠道/字数/笔数，不含泄露的字',
+    cbEvents.every(e => e.type !== 'callback.recorded' || !JSON.stringify(e).includes('RUBY'))
+    && cbEvents.some(e => e.type === 'callback.recorded'));
 
   console.log(`\n全部通过：${passed} 项断言`);
 }

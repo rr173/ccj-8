@@ -9,8 +9,8 @@
 
 const {
   codePoints, contentOpcodes, mapRange, mapRangeLoose, maskBlock, extractMasks,
-  validateAuthorEdit, cpLen, MARK, MARK_END, hashPassword, randomToken,
-  mergeParagraphs, paragraphBounds,
+  validateAuthorEdit, cpLen, MARK, MARK_END, hashPassword, randomToken, sha256Hex,
+  mergeParagraphs, paragraphBounds, diffOpcodes,
 } = require('./util');
 
 class Service {
@@ -60,6 +60,7 @@ class Service {
       released: (doc.releases || []).length,
       paragraphs: paragraphBounds(doc.content).length,
       derived: Object.values(d.docs).filter(x => x.parentId === doc.id).length,
+      callbacks: ((d.callbacks && d.callbacks[doc.id]) || []).length,
     })));
   }
 
@@ -392,6 +393,162 @@ class Service {
     // 未放行任何段：空字符串。段与段之间用换行连接，不补发被省略段的空行。
     return { id: doc.id, title: doc.title, status: doc.status, content: parts.join('\n'),
       masks: ranges, released: rels.length, closedAt: doc.closedAt };
+  }
+
+  // ---------- 渠道回传记账（只追加、永不修改/抹除） ----------
+  // 渠道把“实际发出去的字”回传回来，必须对着某一份投放稿、写明渠道。拿回传跟
+  // 这一份【此刻外面能看见的字】（external() 的结果）对：
+  //   - 一字不差才算干净（clean）；
+  //   - 回传里出现了外面已经看不见的字（外面没有的字/被遮罩抹去的字/旧稿字）：
+  //     记一笔【泄露】；
+  //   - 回传比外面少了【整段】已经能看见的段：记一笔【少发】（段内缺字属对不上，
+  //     记泄露，不记少发——少发按“整段”口径）。
+  // 记账只追加：同一渠道对同一份可以再回传，每次单独记账；已经记下的泄露/少发
+  // 不能改、也不能靠再回传一次抹掉。回传不改内部正文，也不能把抹掉的字救回来：
+  // 回传里多出来的“泄露的字”不按原文落盘，只存字数 + SHA-256 指纹，原始的字只在
+  // 本次响应里返回给记账人看一眼，落盘文件里依然搜不到。
+  // 外面还看不见任何字的投放稿（未放行任何段），不收回传。
+  async registerCallback(docId, channel, content, actor) {
+    if (actor !== 'author') throw httpError(403, '只有作者可以登记渠道回传');
+    const chan = normalizeChannel(channel);
+    if (!chan) throw httpError(400, '必须写明渠道');
+    if (typeof content !== 'string') throw httpError(400, '回传内容必须是文本');
+    return this.store.tx(d => {
+      const doc = d.docs[docId];
+      if (!doc) throw httpError(404, '文档不存在');
+      if (!doc.parentId) throw httpError(400, '渠道回传只对投放稿登记（母稿整篇对外，无按段放行口径）');
+
+      // “此刻外面能看见的字”——与免登录对外接口同一口径
+      const ext = doc.parentId ? this._externalReleased(d, doc) : this._externalFull(doc);
+      if (ext.content === '') {
+        throw httpError(409, '这一份还没有任何对外可见的字（未放行段落），不能收回传');
+      }
+
+      const received = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+      const verdict = this._reconcileCallback(ext.content, received);
+
+      d.callbacks = d.callbacks || {};
+      d.callbacks[docId] = d.callbacks[docId] || [];
+      d.counters.callback = (d.counters.callback || 0) + 1;
+      const id = 'cb_' + d.counters.callback;
+      const sameChan = d.callbacks[docId].filter(c => c.channel === chan);
+      const record = {
+        id,
+        docId,
+        channel: chan,
+        seq: sameChan.length + 1,   // 该渠道对这一份是第几次回传
+        at: new Date().toISOString(),
+        by: actor,
+        chars: cpLen(received),
+        clean: verdict.clean,
+        leak: {
+          count: verdict.leaks.length,
+          chars: verdict.leakChars,
+          // 每处泄露片段只存指纹，不存字——回传不能把抹掉的字救回落盘文件
+          items: verdict.leaks.map(f => ({ len: cpLen(f), sha256: sha256Hex(f) })),
+        },
+        missing: verdict.missing,
+        externalLen: cpLen(ext.content),
+      };
+      d.callbacks[docId].push(record);
+      this._event(d, 'callback.recorded', actor, docId, {
+        callback: id, channel: chan, seq: record.seq,
+        clean: record.clean, leakCount: record.leak.count, leakChars: record.leak.chars,
+        missing: record.missing.length,
+      });
+      // 原始“泄露的字”只随本次响应返回，不进记录、不落盘
+      return {
+        callback: this._callbackView(record),
+        leakFragments: verdict.clean ? [] : verdict.leaks,
+        missingParagraphs: verdict.missing,
+      };
+    });
+  }
+
+  // 拿“外面此刻能看见的字” externalText 对“渠道实际发出的字” received：
+  // 用 code-point 级 diff（遮罩位置在对外稿里已是 █，与普通字一样逐字对）。
+  // 返回 { clean, leaks:[多出/对不上的片段], leakChars, missing:[整段没发的段] }。
+  // 保守口径：顺序对不上（如整段调换）按“对不上 → 泄露”，不放过任何外面没有的字。
+  // 少发只认“整段缺席”：某段一个字都没对上才算少发；段在场、只是字对不上，
+  // 走泄露（不能把脏段同时算作少发）。
+  _reconcileCallback(externalText, received) {
+    const extChars = codePoints(externalText);
+    const rcvChars = codePoints(received);
+    const ops = diffOpcodes(extChars, rcvChars);
+    const leakRanges = [];   // received 坐标里“外面没有”的区间
+    const aligned = new Array(extChars.length).fill(false); // 外面的字是否被对上
+    for (const [tag, i1, i2, j1, j2] of ops) {
+      if (tag === 'insert') leakRanges.push([j1, j2]);
+      else if (tag === 'replace') leakRanges.push([j1, j2]);
+      else if (tag === 'equal') for (let k = i1; k < i2; k++) aligned[k] = true;
+      // delete = 外面有、回传里没有：段内缺字不在此记泄露
+    }
+    const leaks = leakRanges.map(([a, b]) => rcvChars.slice(a, b).join('')).filter(s => s.length);
+    const leakChars = leaks.reduce((n, s) => n + cpLen(s), 0);
+
+    // 少发：按换行切段。某段没有一段“连着对上”的完整残片（连续对齐字数不足该段
+    // 一半、且至少 2 字），视为这一整段没发。要求连续（而非零散）对齐，是为了
+    // 不让其他段里零星的同字/标点把缺席的段“凑在场”；段在场、只是一部分字对不
+    // 上（如夹带已遮罩的旧字），对不上的部分走泄露，不记少发。
+    const missing = [];
+    let pStart = 0, pIdx = 0;
+    for (let i = 0; i <= extChars.length; i++) {
+      if (i === extChars.length || extChars[i] === '\n') {
+        const len = i - pStart;
+        if (len > 0) {
+          let run = 0, longest = 0;
+          for (let k = pStart; k < i; k++) {
+            if (aligned[k]) { run++; if (run > longest) longest = run; }
+            else run = 0;
+          }
+          const needRun = Math.max(2, Math.floor(len / 2));
+          if (longest < needRun) missing.push({ index: pIdx, len });
+        }
+        pStart = i + 1; pIdx++;
+      }
+    }
+
+    const clean = leakRanges.length === 0 && missing.length === 0;
+    return { clean, leaks, leakChars, missing };
+  }
+
+  _callbackView(c) {
+    return {
+      id: c.id, channel: c.channel, seq: c.seq, at: c.at, by: c.by,
+      chars: c.chars, externalLen: c.externalLen,
+      clean: c.clean,
+      leak: { count: c.leak.count, chars: c.leak.chars, items: c.leak.items },
+      missing: c.missing,
+    };
+  }
+
+  // 查某一份各渠道的回传：回过几次、每笔是否有泄露/少发（可按渠道过滤）。
+  async callbacks(docId, channel) {
+    return this.store.read(d => {
+      const doc = d.docs[docId];
+      if (!doc) throw httpError(404, '文档不存在');
+      const all = (d.callbacks && d.callbacks[docId]) || [];
+      const chan = channel ? normalizeChannel(channel) : null;
+      if (chan && !all.some(c => c.channel === chan)) {
+        throw httpError(404, '该渠道没有对这一份回过传');
+      }
+      const list = (chan ? all.filter(c => c.channel === chan) : all).map(c => this._callbackView(c));
+      return { docId, channel: chan, count: list.length, callbacks: list, summary: this._callbackSummary(list) };
+    });
+  }
+
+  _callbackSummary(list) {
+    const byChannel = {};
+    for (const c of list) {
+      const s = byChannel[c.channel] || (byChannel[c.channel] =
+        { channel: c.channel, count: 0, leakCallbacks: 0, missingCallbacks: 0, leakChars: 0, clean: 0 });
+      s.count += 1;
+      if (c.leak.count > 0) s.leakCallbacks += 1;
+      if (c.missing.length > 0) s.missingCallbacks += 1;
+      s.leakChars += c.leak.chars;
+      if (c.clean) s.clean += 1;
+    }
+    return Object.values(byChannel);
   }
 
   // ---------- 批注查询 ----------
@@ -902,6 +1059,7 @@ class Service {
 
   _docView(d, doc) {
     const parent = doc.parentId ? d.docs[doc.parentId] : null;
+    const cbList = (d.callbacks && d.callbacks[doc.id]) || [];
     return {
       id: doc.id, title: doc.title, content: doc.content,
       version: doc.version, status: doc.status,
@@ -911,6 +1069,8 @@ class Service {
       baseVersion: doc.baseVersion || null,
       paragraphs: paragraphBounds(doc.content).map(([start, end]) => ({ start, end })),
       releases: (doc.releases || []).map(r => this._releaseView(r)),
+      callbacks: cbList.length,
+      callbackSummary: doc.parentId ? this._callbackSummary(cbList.map(c => this._callbackView(c))) : [],
       parent: parent ? { id: parent.id, title: parent.title } : null,
       derived: this._childrenOf(d, doc.id).map(x => ({ id: x.id, title: x.title, status: x.status })),
     };
@@ -921,6 +1081,13 @@ function httpError(status, message) {
   const e = new Error(message);
   e.status = status;
   return e;
+}
+
+// 渠道名：去掉两端空白，压缩内部连续空白，限长。渠道名只记账、不做账号体系。
+function normalizeChannel(channel) {
+  if (typeof channel !== 'string') return '';
+  const c = channel.trim().replace(/\s+/g, ' ');
+  return c.slice(0, 100);
 }
 
 module.exports = { Service, httpError };

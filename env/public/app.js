@@ -10,6 +10,7 @@ const state = {
   doc: null,
   annotations: [],
   events: [],
+  callbacks: null,
   selection: null,       // {start,end,text}（content 坐标）
   repositionId: null,   // 正在重新定位的批注
   pollTimer: null,
@@ -186,20 +187,25 @@ $('#closeDocBtn').onclick = async () => {
 
 async function reloadDoc(opts = {}) {
   try {
+    const id = opts.id || (state.doc && state.doc.id);
     const [doc, annotations, events] = await Promise.all([
-      api('GET', '/api/docs/' + encodeURIComponent(opts.id || (state.doc && state.doc.id))),
-      api('GET', `/api/docs/${opts.id || (state.doc && state.doc.id)}/annotations`),
-      api('GET', `/api/docs/${opts.id || (state.doc && state.doc.id)}/events`),
+      api('GET', '/api/docs/' + encodeURIComponent(id)),
+      api('GET', `/api/docs/${id}/annotations`),
+      api('GET', `/api/docs/${id}/events`),
     ]).catch(async () => {
       // id 仅在第一次有；上面 Promise 拿不到时退化为顺序
-      const id = opts.id || state.doc.id;
       return [
         await api('GET', '/api/docs/' + id),
         await api('GET', `/api/docs/${id}/annotations`),
         await api('GET', `/api/docs/${id}/events`),
       ];
     });
-    state.doc = doc; state.annotations = annotations; state.events = events;
+    // 渠道回传账只对投放稿查询
+    let callbacks = null;
+    if (doc.parentId) {
+      try { callbacks = await api('GET', `/api/docs/${id}/callbacks`); } catch { callbacks = { callbacks: [], summary: [] }; }
+    }
+    state.doc = doc; state.annotations = annotations; state.events = events; state.callbacks = callbacks;
     renderDoc(opts);
   } catch (e) {
     if (!opts.silent) toast(e.message);
@@ -231,6 +237,7 @@ function renderDoc(opts = {}) {
   renderAnnotationList();
   renderMaskCard();
   renderReleaseCard();
+  renderCallbackCard();
   renderEvents();
   const isAuthor = state.me.role === 'author';
   const frozen = doc.status !== 'open';
@@ -629,6 +636,81 @@ async function releaseParagraph(p) {
   }
 }
 
+// ---------- 渠道回传对账（投放稿、作者登记） ----------
+function renderCallbackCard() {
+  const card = $('#callbackCard');
+  if (!state.doc.parentId) { card.classList.add('hidden'); return; }
+  card.classList.remove('hidden');
+  const isAuthor = state.me.role === 'author';
+  $('#cbSubmit').classList.toggle('hidden', !isAuthor);
+  $('#cbChannel').disabled = !isAuthor;
+  $('#cbContent').disabled = !isAuthor;
+
+  const data = state.callbacks || { callbacks: [], summary: [] };
+  // 分渠道汇总
+  const sum = $('#callbackSummary');
+  if (data.summary && data.summary.length) {
+    sum.innerHTML = '<h3>分渠道账</h3>' + data.summary.map(s => {
+      const bad = s.leakCallbacks > 0 || s.missingCallbacks > 0;
+      return `<div class="cb-sum ${bad ? 'bad' : 'ok'}">
+        <b>${esc(s.channel)}</b> · 回传 ${s.count} 次
+        <span class="badge ${s.leakCallbacks ? 'orphaned' : 'accepted'}">泄露 ${s.leakCallbacks}</span>
+        <span class="badge ${s.missingCallbacks ? 'orphaned' : 'accepted'}">少发 ${s.missingCallbacks}</span>
+        <span class="badge ${s.clean ? 'accepted' : 'rejected'}">干净 ${s.clean}</span>
+      </div>`;
+    }).join('');
+  } else {
+    sum.innerHTML = '<p class="hint">还没有任何渠道回传。</p>';
+  }
+
+  // 每笔账（最新在前）；旧的泄露/少发永远在
+  const host = $('#callbackList');
+  const items = (data.callbacks || []).slice().reverse();
+  host.innerHTML = items.map(c => {
+    const leak = c.leak.count > 0;
+    const miss = c.missing.length > 0;
+    const badge = c.clean
+      ? '<span class="badge accepted">干净</span>'
+      : [leak ? '<span class="badge orphaned">泄露</span>' : '', miss ? '<span class="badge orphaned">少发</span>' : ''].join(' ');
+    const detail = leak
+      ? `<div class="hint">回传里有 ${c.leak.count} 处、${c.leak.chars} 字是外面看不见的（已记指纹，不显示/不落原字）。</div>` : '';
+    const missDetail = miss
+      ? `<div class="hint">少发第 ${c.missing.map(m => m.index + 1).join('、')} 段（共 ${c.missing.reduce((a, m) => a + m.len, 0)} 字）。</div>` : '';
+    return `<div class="cb-item ${c.clean ? 'ok' : 'bad'}">
+      <div class="meta">${badge}<b>${esc(c.channel)}</b>
+        <span>第 ${c.seq} 次</span><span>${esc(c.by)} · ${fmtTime(c.at)}</span></div>
+      <div class="hint">回传 ${c.chars} 字 · 此刻外面 ${c.externalLen} 字</div>
+      ${detail}${missDetail}
+    </div>`;
+  }).join('');
+}
+
+$('#cbSubmit').onclick = async () => {
+  $('#cbMsg').textContent = '';
+  const channel = $('#cbChannel').value.trim();
+  const content = $('#cbContent').value;
+  if (!channel) { $('#cbMsg').textContent = '必须写明渠道'; return; }
+  if (content === '') {
+    if (!confirm('回传内容为空：将记为全部已可见段少发。确定？')) return;
+  }
+  try {
+    const r = await api('POST', `/api/docs/${state.doc.id}/callbacks`, { channel, content });
+    const c = r.callback;
+    if (c.clean) {
+      toast(`已记账（${channel} 第 ${c.seq} 次）：对得上，干净`);
+    } else {
+      const frags = (r.leakFragments || []).map(s => s.replace(/\n/g, '⏎')).join(' / ').slice(0, 120);
+      const miss = (r.missingParagraphs || []).length;
+      alert(`已记账（${channel} 第 ${c.seq} 次）：\n\n`
+        + (c.leak.count ? `泄露 ${c.leak.count} 处、${c.leak.chars} 字（外面看不见的字），例如：\n${frags}\n\n` : '')
+        + (miss ? `少发 ${miss} 整段。\n` : '')
+        + '这笔账不可修改，再回传一次也抹不掉。');
+    }
+    $('#cbContent').value = '';
+    await reloadDoc();
+  } catch (e) { $('#cbMsg').textContent = e.message; }
+};
+
 // ---------- 遮罩侧栏 ----------
 const MASK_STATUS_TEXT = {
   proposed: '待双人点头',
@@ -744,6 +826,13 @@ const EVENT_TEXT = {
   'annotation.sealed': '一条批注因与遮罩重叠被永久封存',
   'paragraph.released': d => `作者放行第 ${(d.paragraph || 0) + 1} 段（外面只能看到放行时遮完后的字；不可收回）`,
   'release.scrubbed': d => `新增遮罩追加生效：已放行段对外快照再遮 ${d.len} 字（外面能读到的字只会更少）`,
+  'callback.recorded': d => {
+    if (d.clean) return `渠道「${d.channel}」第 ${d.seq} 次回传：与外面此刻能看见的字一致，干净`;
+    const parts = [];
+    if (d.leakCount > 0) parts.push(`泄露 ${d.leakCount} 处/${d.leakChars} 字`);
+    if (d.missing > 0) parts.push(`少发 ${d.missing} 段`);
+    return `渠道「${d.channel}」第 ${d.seq} 次回传：${parts.join('、')}（已记账，不可抹）`;
+  },
   'review.closed': '审阅结束，对外稿冻结',
 };
 function kindName(k) { return k === 'mask' ? '遮罩提议' : k === 'suggest' ? '修改建议' : '批注'; }

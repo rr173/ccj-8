@@ -243,6 +243,72 @@ async function nodBoth(docId, start, end, version) {
     ok('落盘文件无被遮文字',
       !fs.readFileSync(dataFile, 'utf8').includes('TOPSECRET9') && !fs.readFileSync(dataFile, 'utf8').includes('三段更新'));
 
+    console.log('D) 渠道回传记账（投放稿对账：干净 / 泄露 / 少发，只追加不可抹）');
+    // 用一份新的母稿+投放稿，放行前两段，便于精确断言
+    const cbText = '对外可见首段甲。\n二段公开内容乙。\n未放行内部段丙。';
+    const cbMc = await req('author', 'POST', '/api/docs', { title: '回传母稿', content: cbText });
+    const cbMid = cbMc.body.id;
+    const cbKid = (await req('author', 'POST', `/api/docs/${cbMid}/derive`, { title: '回传投放稿' })).body.id;
+    for (const p of [0, 1]) {
+      const cur = (await req('author', 'GET', `/api/docs/${cbKid}`)).body;
+      await req('author', 'POST', `/api/docs/${cbKid}/release`, { paragraph: p, version: cur.version });
+    }
+    const cbExt = (await req(null, 'GET', `/api/docs/${cbKid}/external`)).body;
+    ok('外面此刻只看得见前两段', cbExt.content === '对外可见首段甲。\n二段公开内容乙。' && cbExt.released === 2);
+
+    // 未放行任何段的投放稿不收（另起一份从未放行的）
+    const emptyKid = (await req('author', 'POST', `/api/docs/${cbMid}/derive`, { title: '未放行稿' })).body.id;
+    const gate = await req('author', 'POST', `/api/docs/${emptyKid}/callbacks`, { channel: '渠道X', content: 'x' });
+    ok('外面还看不见字 → 409 不收回传', gate.status === 409);
+    ok('母稿不收回传', (await req('author', 'POST', `/api/docs/${cbMid}/callbacks`, { channel: 'X', content: cbText })).status === 400);
+    ok('审阅人不能登记回传', (await req('reviewer', 'POST', `/api/docs/${cbKid}/callbacks`,
+      { channel: '渠道X', content: cbExt.content })).status === 403);
+    ok('未登录不能登记', (await req(null, 'POST', `/api/docs/${cbKid}/callbacks`,
+      { channel: '渠道X', content: cbExt.content })).status === 401);
+    const noChan = await req('author', 'POST', `/api/docs/${cbKid}/callbacks`, { channel: '  ', content: cbExt.content });
+    ok('不写渠道 → 400', noChan.status === 400);
+
+    // 干净回传
+    const clean = await req('author', 'POST', `/api/docs/${cbKid}/callbacks`, { channel: '渠道甲', content: cbExt.content });
+    ok('干净回传 201 且 clean', clean.status === 201 && clean.body.callback.clean === true
+      && clean.body.callback.seq === 1 && clean.body.leakFragments.length === 0);
+
+    // 泄露：把外面看不见的第三段也发了
+    const leak = await req('author', 'POST', `/api/docs/${cbKid}/callbacks`, { channel: '渠道乙', content: cbText });
+    ok('夹带未放行段：泄露且非少发', leak.status === 201 && leak.body.callback.clean === false
+      && leak.body.callback.leak.count >= 1 && leak.body.callback.missing.length === 0
+      && JSON.stringify(leak.body.leakFragments).includes('未放行内部段丙'));
+
+    // 少发：只回传第一段（第二段整段缺席）
+    const short = await req('author', 'POST', `/api/docs/${cbKid}/callbacks`, { channel: '渠道乙', content: '对外可见首段甲。' });
+    ok('缺了整段已可见的字：少发一笔', short.body.callback.missing.length === 1
+      && short.body.callback.missing[0].index === 1);
+
+    // 母稿遮掉“公开”，渠道回传仍带旧字 → 泄露；落盘文件不含该字
+    const cbMCur = (await req('reviewer', 'GET', `/api/docs/${cbMid}`)).body;
+    const gPos = cpIndexOf(cbMCur.content, '公开');
+    await nodBoth(cbMid, gPos, gPos + 2, cbMCur.version);
+    const cbExt2 = (await req(null, 'GET', `/api/docs/${cbKid}/external`)).body;
+    ok('遮罩后外面读不到“公开”', !cbExt2.content.includes('公开') && cbExt2.content.includes('██'));
+    const leakMask = await req('author', 'POST', `/api/docs/${cbKid}/callbacks`,
+      { channel: '渠道甲', content: '对外可见首段甲。\n二段公开内容乙。' });
+    ok('回传出现外面已看不见的“公开”：泄露', leakMask.body.callback.clean === false
+      && JSON.stringify(leakMask.body.leakFragments).includes('公开'));
+    ok('泄露的字不进回传账（只存指纹/字数）',
+      !JSON.stringify(JSON.parse(fs.readFileSync(dataFile, 'utf8')).callbacks[cbKid]).includes('公开'));
+
+    // 渠道甲再回一次干净的：旧泄露仍在
+    const clean2 = await req('author', 'POST', `/api/docs/${cbKid}/callbacks`, { channel: '渠道甲', content: cbExt2.content });
+    ok('再回传干净本笔 seq=3', clean2.body.callback.seq === 3 && clean2.body.callback.clean === true);
+    const chanA = (await req('author', 'GET', `/api/docs/${cbKid}/callbacks?channel=${encodeURIComponent('渠道甲')}`)).body;
+    ok('能查该渠道回过几次、有过泄露', chanA.count === 3
+      && chanA.summary[0].leakCallbacks === 1 && chanA.summary[0].count === 3);
+    const chanB = (await req('author', 'GET', `/api/docs/${cbKid}/callbacks?channel=${encodeURIComponent('渠道乙')}`)).body;
+    ok('渠道乙两笔：泄露 1、少发 1', chanB.summary[0].leakCallbacks === 1 && chanB.summary[0].missingCallbacks === 1);
+    const allCb = (await req('reviewer', 'GET', `/api/docs/${cbKid}/callbacks`)).body;
+    ok('审阅人也能查全部回传（分渠道汇总）', allCb.count === 5 && allCb.summary.length === 2);
+    ok('未知渠道查询 404', (await req('author', 'GET', `/api/docs/${cbKid}/callbacks?channel=无`)).status === 404);
+
     console.log(`\nHTTP 端到端全部通过：${passed} 项`);
   } finally {
     srv.kill();
