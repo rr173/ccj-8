@@ -469,43 +469,63 @@ class Service {
   // 用 code-point 级 diff（遮罩位置在对外稿里已是 █，与普通字一样逐字对）。
   // 返回 { clean, leaks:[多出/对不上的片段], leakChars, missing:[整段没发的段] }。
   // 保守口径：顺序对不上（如整段调换）按“对不上 → 泄露”，不放过任何外面没有的字。
-  // 少发只认“整段缺席”：某段一个字都没对上才算少发；段在场、只是字对不上，
-  // 走泄露（不能把脏段同时算作少发）。
+  // 少发只认“整段没发”：段里可见的字有一半以上被逐字照发（equal）才算同一段
+  // 还在；把已遮代号按原文送回时，上下文可见字全部 equal、只有 █ 是 replace，于是
+  // 只标泄露、绝不记整段少发。整段没发/换成不相干的字时可见字对不上 equal，才记少发。
   _reconcileCallback(externalText, received) {
     const extChars = codePoints(externalText);
     const rcvChars = codePoints(received);
     const ops = diffOpcodes(extChars, rcvChars);
     const leakRanges = [];   // received 坐标里“外面没有”的区间
-    const aligned = new Array(extChars.length).fill(false); // 外面的字是否被对上
+    // 每个对外字的下场：'eq' 照发 | 'rep' 发了对不上的字 | 'del' 没发 | null 未覆盖
+    const cover = new Array(extChars.length).fill(null);
     for (const [tag, i1, i2, j1, j2] of ops) {
-      if (tag === 'insert') leakRanges.push([j1, j2]);
-      else if (tag === 'replace') leakRanges.push([j1, j2]);
-      else if (tag === 'equal') for (let k = i1; k < i2; k++) aligned[k] = true;
-      // delete = 外面有、回传里没有：段内缺字不在此记泄露
+      if (tag === 'insert') {
+        leakRanges.push([j1, j2]);
+      } else if (tag === 'replace') {
+        leakRanges.push([j1, j2]);
+        for (let k = i1; k < i2; k++) cover[k] = 'rep';
+      } else if (tag === 'delete') {
+        for (let k = i1; k < i2; k++) cover[k] = 'del';
+      } else { // equal
+        for (let k = i1; k < i2; k++) cover[k] = 'eq';
+      }
     }
     const leaks = leakRanges.map(([a, b]) => rcvChars.slice(a, b).join('')).filter(s => s.length);
     const leakChars = leaks.reduce((n, s) => n + cpLen(s), 0);
 
-    // 少发：按换行切段。某段没有一段“连着对上”的完整残片（连续对齐字数不足该段
-    // 一半、且至少 2 字），视为这一整段没发。要求连续（而非零散）对齐，是为了
-    // 不让其他段里零星的同字/标点把缺席的段“凑在场”；段在场、只是一部分字对不
-    // 上（如夹带已遮罩的旧字），对不上的部分走泄露，不记少发。
+    // 按换行切段，判定每段“在不在”。同一段在不在，看它【外面可见的字】（非 █）
+    // 有多少被【逐字照发】（equal）——这是“同一段还在”的唯一硬证据：
+    //   · 把已遮代号按原文送回时，段内可见的上下文（如“代号…是机密”）全部 equal，
+    //     只有 █ 那截是 replace → 段在场，replace 只产生泄露，绝不记少发；
+    //   · 整段没发/换成一段不相干的字时，可见字几乎对不上 equal（可能只蹭到句号
+    //     这类零散同字）→ 达不到一半，记整段少发。
+    // 被遮的 █ 本来外面就读不到，不计入“在场”分母，也不因其空缺记少发；只有整段
+    // 全是遮罩、没有可见字可作锚时，才看每个 █ 是否都被按别的字填回（填回=在场，
+    // 同时记泄露；什么都没发=整段少发）。
+    const RATIO = 0.5;
     const missing = [];
     let pStart = 0, pIdx = 0;
     for (let i = 0; i <= extChars.length; i++) {
-      if (i === extChars.length || extChars[i] === '\n') {
-        const len = i - pStart;
-        if (len > 0) {
-          let run = 0, longest = 0;
-          for (let k = pStart; k < i; k++) {
-            if (aligned[k]) { run++; if (run > longest) longest = run; }
-            else run = 0;
+      if (i !== extChars.length && extChars[i] !== '\n') continue;
+      const len = i - pStart;
+      if (len > 0) {
+        let visible = 0, visibleExact = 0, masked = 0, maskedFilled = 0;
+        for (let k = pStart; k < i; k++) {
+          if (extChars[k] === '█') {
+            masked++;
+            if (cover[k] === 'rep') maskedFilled++;
+          } else {
+            visible++;
+            if (cover[k] === 'eq') visibleExact++;
           }
-          const needRun = Math.max(2, Math.floor(len / 2));
-          if (longest < needRun) missing.push({ index: pIdx, len });
         }
-        pStart = i + 1; pIdx++;
+        const present = visible > 0
+          ? visibleExact / visible >= RATIO
+          : maskedFilled === masked;
+        if (!present) missing.push({ index: pIdx, len });
       }
+      pStart = i + 1; pIdx++;
     }
 
     const clean = leakRanges.length === 0 && missing.length === 0;

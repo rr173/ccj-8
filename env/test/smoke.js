@@ -625,6 +625,54 @@ async function main() {
     cbEvents.every(e => e.type !== 'callback.recorded' || !JSON.stringify(e).includes('RUBY'))
     && cbEvents.some(e => e.type === 'callback.recorded'));
 
+  console.log('27) 已遮代号按原文送回：只标脏，绝不把还在的段标成少发');
+  const CODE = 'ULTRASECRET-9999';
+  const fxText = `代号${CODE}是机密。\n第二段普通内容。`;
+  const fxMaster = await svc.createDoc('代号母稿', fxText, 'author');
+  const fxDoc = await svc.deriveDoc(fxMaster.id, '代号投放稿', 'author');
+  const fxMDoc = await svc.getDoc(fxMaster.id);
+  const cPos = cpIndexOf(fxMDoc.content, CODE);
+  await nodBoth(fxMaster.id, cPos, cPos + cpLen(CODE), fxMDoc.version);
+  await svc.releaseParagraph(fxDoc.id, 0, 'author', (await svc.getDoc(fxDoc.id)).version);
+  const fxExt = (await svc.external(fxDoc.id)).content;
+  ok('外面这段的代号已是 █、上下文还在',
+    fxExt.split('\n')[0] === `代号${'█'.repeat(cpLen(CODE))}是机密。`);
+
+  // (a) 渠道把代号按原文整段送回：泄露（脏），但这段还在 → 不能记少发
+  const restored = await svc.registerCallback(fxDoc.id, '渠道一', `代号${CODE}是机密。`, 'author');
+  ok('按原文送回已遮代号：标泄露', restored.callback.clean === false
+    && restored.leakFragments.join('').includes(CODE));
+  ok('同一段还在：不标少发', restored.callback.missing.length === 0);
+  const restoredRaw = fs.readFileSync(path.join(tmp, 'data.json'), 'utf8');
+  ok('送回的代号不落盘', !restoredRaw.includes(CODE));
+
+  // (b) 段内有小改、代号也送回：仍只标脏、不标少发
+  const tweaked = await svc.registerCallback(fxDoc.id, '渠道二', `代号${CODE}是机密哒。`, 'author');
+  ok('小改 + 代号送回：标泄露', tweaked.callback.leak.chars > 0);
+  ok('段仍在场：不标少发', tweaked.callback.missing.length === 0);
+
+  // (c) 整段全是遮罩：渠道按原文送回 → 只脏不少发；什么都不发 → 才少发
+  const fx2 = await svc.createDoc('全遮母稿', 'ABCDEF', 'author');
+  const fx2d = await svc.deriveDoc(fx2.id, '全遮投放稿', 'author');
+  await nodBoth(fx2.id, 0, 6, 1);
+  await svc.releaseParagraph(fx2d.id, 0, 'author', (await svc.getDoc(fx2d.id)).version);
+  ok('整段对外只见 █', (await svc.external(fx2d.id)).content === '██████');
+  const allMaskLeak = await svc.registerCallback(fx2d.id, '渠道一', 'ABCDEF', 'author');
+  ok('全遮段按原文送回：泄露', allMaskLeak.callback.leak.chars === 6);
+  ok('全遮段按原文送回：不标少发', allMaskLeak.callback.missing.length === 0);
+  const allMaskEmpty = await svc.registerCallback(fx2d.id, '渠道二', '', 'author');
+  ok('全遮段什么都没发：标少发', allMaskEmpty.callback.missing.length === 1
+    && allMaskEmpty.callback.missing[0].index === 0);
+
+  // (d) 对照：真把这段换成不相干的字/干脆不发 → 仍要记整段少发
+  const replaced = await svc.registerCallback(fxDoc.id, '渠道三', '第二段普通内容。', 'author');
+  ok('第一段缺席（只剩第二段）：第一段记少发',
+    replaced.callback.missing.length === 1 && replaced.callback.missing[0].index === 0);
+  const onlyFirst = await svc.registerCallback(fxDoc.id, '渠道四',
+    fxExt.split('\n')[0], 'author');
+  ok('只发第一段（第二段没放行、外面本就没有）：无少发、无泄露',
+    onlyFirst.callback.clean === true);
+
   console.log(`\n全部通过：${passed} 项断言`);
 }
 main().catch(e => { console.error('测试失败:', e); process.exit(1); });

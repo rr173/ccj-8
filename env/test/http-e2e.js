@@ -309,6 +309,30 @@ async function nodBoth(docId, start, end, version) {
     ok('审阅人也能查全部回传（分渠道汇总）', allCb.count === 5 && allCb.summary.length === 2);
     ok('未知渠道查询 404', (await req('author', 'GET', `/api/docs/${cbKid}/callbacks?channel=无`)).status === 404);
 
+    console.log('E) 已遮代号按原文送回：只标脏，不把还在的段标成少发');
+    const codeText = '代号VULCAN-77是机密。\n第二段普通内容。';
+    const eMc = await req('author', 'POST', '/api/docs', { title: '代号母稿', content: codeText });
+    const eMid = eMc.body.id;
+    const eKid = (await req('author', 'POST', `/api/docs/${eMid}/derive`, { title: '代号投放稿' })).body.id;
+    const ePos = cpIndexOf(codeText, 'VULCAN-77');
+    await nodBoth(eMid, ePos, ePos + 'VULCAN-77'.length, 1);
+    await req('author', 'POST', `/api/docs/${eKid}/release`, { paragraph: 0 });
+    const eExt = (await req(null, 'GET', `/api/docs/${eKid}/external`)).body;
+    ok('外面代号已遮、上下文在', eExt.content === `代号${'█'.repeat('VULCAN-77'.length)}是机密。`);
+    // 渠道按原文整段送回
+    const eCb = await req('author', 'POST', `/api/docs/${eKid}/callbacks`,
+      { channel: '渠道甲', content: '代号VULCAN-77是机密。' });
+    ok('按原文送回：泄露标记', eCb.body.callback.clean === false
+      && JSON.stringify(eCb.body.leakFragments).includes('VULCAN-77'));
+    ok('按原文送回：不标少发（段还在）', eCb.body.callback.missing.length === 0);
+    ok('送回的代号不落盘',
+      !JSON.stringify(JSON.parse(fs.readFileSync(dataFile, 'utf8')).callbacks[eKid]).includes('VULCAN-77'));
+    // 真·整段缺席仍要记少发
+    const eMiss = await req('author', 'POST', `/api/docs/${eKid}/callbacks`,
+      { channel: '渠道乙', content: '第二段普通内容。' });
+    ok('第一段缺席：记少发', eMiss.body.callback.missing.length === 1
+      && eMiss.body.callback.missing[0].index === 0);
+
     console.log(`\nHTTP 端到端全部通过：${passed} 项`);
   } finally {
     srv.kill();
