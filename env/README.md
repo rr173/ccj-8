@@ -3,9 +3,11 @@
 审阅人在原文网页上划两层标记：
 
 1. **可逆批注层** —— 评论 / 修改建议。作者可以**接受**（修改建议直接替换进原文）或**打回**（原文保持不变）。
-2. **不可逆遮罩层** —— 审阅人划出拟遮罩区段，**预览遮罩后的对外稿**，确认后被遮的字从正文和历史中永久抹除：
-   - 确认即把正文里的字替换成 `⟦██…⟧` 原子占位符并落盘，不留任何快照、备份、可还原编码；
-   - 历史事件只记录“遮罩 N 字”，不含被遮内容；
+2. **不可逆遮罩层（双人确认）** —— 审阅人划出拟遮罩区段即一次“点头”，**同一处选区必须有两位不同的审阅人各自点头、且两人划的范围完全一致**，预览确认后被遮的字才从正文和历史中永久抹除：
+   - 只有一位审阅人点过头，或两人划的范围对不上：都**不算点齐**，正文一个字不动，对外仍能读到；
+   - 一位审阅人已经点头后，作者改动了这段字（选区内部任何增/删/改）：该点头立即**作废**，不能拿改之前的选区去遮现在的正文；只有编辑全在选区外、或仅贴边界插入时，点头才随 diff 平移保留；作废后需在当前正文上重新划、重新点；
+   - 点齐即把正文里的字替换成 `⟦██…⟧` 原子占位符并落盘，不留任何快照、备份、可还原编码；
+   - 历史事件只记录“遮罩 N 字 / 谁点的头”，不含被遮内容；
    - 与遮罩选区重叠的批注一并**封存**（只保留“某条批注被封存”，备注/替换文清空）；
    - 作者再改原文时，已确认遮罩块不能删除、移动、改长度（服务端用 token 级 diff 强校验）；
    - 对外稿接口剥除系统标记，任何人（免登录）只能读到 █。
@@ -31,24 +33,31 @@
 | 账号 | 能做什么 |
 |---|---|
 | `author` 作者 | 建文档、派生投放稿、改原文、接受/打回批注、**按段放行投放稿**、读对外稿 |
-| `reviewer` 审阅人 | 划批注/建议/遮罩、预览并确认遮罩、结束审阅 |
+| `reviewer` 审阅人甲 | 划批注/建议、**对遮罩点头**、结束审阅 |
+| `reviewer2` 审阅人乙 | 同审阅人甲；**不可逆遮罩必须甲、乙各点一次同一选区** |
 | 任何人（免登录） | 只读对外稿 `/#/ext/<docId>`（投放稿只能读到已放行的段） |
+
+> 双人确认在应用内强制：系统只有“两位不同审阅人对同一选区的两次点头”这一条路径会真正抹字，
+> 单人（即使重复点击）、两人范围不一致、作者代点都会被拒绝。账号口令层面仍需部署方保证
+> 甲、乙是两个真实的人（不要共用口令）。
 
 ## Docker 部署
 
 ```bash
 # 方式一：docker compose（推荐）
-AUTHOR_PASSWORD='强密码A' REVIEWER_PASSWORD='强密码R' docker compose up -d --build
+AUTHOR_PASSWORD='强密码A' REVIEWER_PASSWORD='强密码R甲' REVIEWER2_PASSWORD='强密码R乙' docker compose up -d --build
 
 # 方式二：docker
 docker build -t copy-review-redact .
 docker run -d -p 8080:8080 \
-  -e AUTHOR_PASSWORD='强密码A' -e REVIEWER_PASSWORD='强密码R' \
+  -e AUTHOR_PASSWORD='强密码A' \
+  -e REVIEWER_PASSWORD='强密码R甲' \
+  -e REVIEWER2_PASSWORD='强密码R乙' \
   -v review-data:/data copy-review-redact
 ```
 
-打开 http://服务器:8080 ，用 `author` / `reviewer` 登录。
-不设置密码环境变量时使用默认密码 `author123` / `reviewer123`（仅限试用）。
+打开 http://服务器:8080 ，用 `author` / `reviewer` / `reviewer2` 登录。
+不设置密码环境变量时使用默认密码 `author123` / `reviewer123` / `reviewer2`（默认同 `REVIEWER_PASSWORD`，未设置时为 `reviewer123`，仅限试用）。
 数据保存在卷 `/data/review.json`。
 
 ## 本地开发
@@ -56,7 +65,7 @@ docker run -d -p 8080:8080 \
 ```bash
 npm install
 DATA_FILE=./data/review.json npm start   # http://localhost:8080
-npm test                                  # 104 项业务断言 + 45 项 HTTP 端到端断言
+npm test                                  # 130 项业务断言 + 52 项 HTTP 端到端断言
 ```
 
 ## API 摘要
@@ -68,10 +77,11 @@ npm test                                  # 104 项业务断言 + 45 项 HTTP �
 - `POST /api/docs/:id/close`（审阅人结束审阅、冻结）
 - `POST /api/docs/:id/release`（作者按段放行，body：`paragraph` 段号、`version`；仅投放稿；同段不可重复放行、不可收回）
 - `GET /api/docs/:id/external`（对外稿，免登录；投放稿只含已放行段，未放行时为空字符串并带 `released` 计数）
-- `GET/POST /api/docs/:id/annotations`（kind: comment / suggest / mask）
+- `GET/POST /api/docs/:id/annotations`（kind: comment / suggest；遮罩不走这里）
 - `POST /api/docs/:id/annotations/:aid/resolve`（action: accept / reject）
-- `POST /api/docs/:id/annotations/:aid/reposition`（失位批注重新定位）
-- `POST /api/docs/:id/masks/preview` · `POST /api/docs/:id/masks/confirm`
+- `POST /api/docs/:id/annotations/:aid/reposition`（失位批注重新定位；遮罩点头作废后不可重定位，只能重新点头）
+- `POST /api/docs/:id/masks/nod`（**双人确认**：body `{start,end,version}`。同一选区由两个不同审阅人各点一次 → 本次事务点齐落盘；返回 `outcome: waiting|already-nodded|confirmed`）
+- `POST /api/docs/:id/masks/preview`（只读预览全部待点头选区点齐后的对外稿；旧 `/masks/confirm` 已下线返回 410）
 - `GET /api/docs/:id/events`（历史，只含类型/字数，不含被遮内容）
 
 ## 不可逆性的边界说明

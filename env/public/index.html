@@ -14,7 +14,8 @@
     <label>用户名
       <select id="loginUser">
         <option value="author">作者 author</option>
-        <option value="reviewer">审阅人 reviewer</option>
+        <option value="reviewer">审阅人 reviewer（甲）</option>
+        <option value="reviewer2">审阅人 reviewer2（乙）</option>
       </select>
     </label>
     <label>密码 <input id="loginPw" type="password" autocomplete="current-password"></label>
@@ -109,10 +110,11 @@
           <div id="annList"></div>
         </div>
         <div class="card" id="maskCard">
-          <h3>不可逆遮罩</h3>
-          <p class="hint">确认前可预览对外效果；确认后被遮的字从正文和历史中永久抹除，作者和审阅人都无法再读到。</p>
+          <h3>不可逆遮罩（双人确认）</h3>
+          <p class="hint">在正文拖选后点“划遮罩”即为一次<b>点头</b>。同一处选区必须由<b>两位不同的审阅人</b>各点一次、
+            <b>范围完全一致</b>才真正抹除；只有一人点头时这些字对外仍可读。点头后作者改过这段字，点头立即作废，需重新划、重新点。</p>
           <div id="maskList"></div>
-          <button id="previewMaskBtn" class="danger">预览遮罩后的对外稿</button>
+          <button id="previewMaskBtn" class="danger">预览全部点齐后的对外稿</button>
         </div>
         <div class="card hidden" id="releaseCard">
           <h3>按段放行（投放）</h3>
@@ -143,14 +145,13 @@
   <!-- 遮罩预览弹层 -->
   <div id="maskModal" class="modal hidden">
     <div class="modal-box card wide">
-      <h3>遮罩后的对外稿（预览，尚未生效）</h3>
+      <h3>若全部点齐，遮罩后的对外稿（预览，尚未生效）</h3>
       <div id="maskPreview" class="doc-text external preview"></div>
       <div id="maskSealWarn" class="warn hidden"></div>
-      <p class="hint">勾选要确认的遮罩段：</p>
+      <p class="hint" id="maskPreviewHint"></p>
       <div id="maskChecks"></div>
       <div class="row right">
-        <button id="maskModalCancel">取消</button>
-        <button id="maskModalOk" class="danger">确认遮罩（不可恢复）</button>
+        <button id="maskModalCancel" class="primary">关闭</button>
       </div>
     </div>
   </div>

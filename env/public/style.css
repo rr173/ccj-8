@@ -122,6 +122,9 @@ span.mask-confirmed {
 .badge.rejected { color: #71717a; border-color: #d4d4d8; }
 .badge.sealed { color: #52525b; border-color: #a1a1aa; }
 .mask-item { border: 1px solid #fecaca; background: #fef2f2; border-radius: 8px; padding: 10px; margin-bottom: 8px; }
+.mask-item.mine { border-color: #fca5a5; box-shadow: inset 3px 0 0 var(--red); }
+.mask-item.void { border-color: #d4d4d8; background: #f4f4f5; opacity: .85; }
+.mask-item.void b { color: #52525b; }
 
 .modal { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: flex; align-items: center; justify-content: center; z-index: 50; }
 .modal-box { max-width: 560px; width: 92%; margin: 0; }

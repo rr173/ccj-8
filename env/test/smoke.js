@@ -20,7 +20,15 @@ async function main() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'review-'));
   const store = new JsonStore(path.join(tmp, 'data.json'));
   const svc = new Service(store);
-  await svc.initUsers('apw', 'rpw');
+  await svc.initUsers('apw', 'rpw', 'r2pw');
+  const R1 = 'reviewer';
+  const R2 = 'reviewer2';
+  // 两位审阅人在同一处选区各点一次头（范围完全一致）→ 点齐落盘
+  async function nodBoth(docId, start, end, version) {
+    const a = await svc.maskNod(docId, start, end, R1, version);
+    const b = await svc.maskNod(docId, start, end, R2, version);
+    return [a, b];
+  }
 
   console.log('1) 创建文档与批注');
   const doc = await svc.createDoc('测试文案', '尊敬的客户，我们的密钥是ABCDEF，请妥善保管。', 'author');
@@ -31,8 +39,20 @@ async function main() {
   const keyEnd = keyStart + 6;
   const c1 = await svc.addAnnotation({ docId: doc.id, kind: 'comment', start: 0, end: 4, note: '称呼太生硬' }, 'reviewer', 1);
   const s1 = await svc.addAnnotation({ docId: doc.id, kind: 'suggest', start: 9, end: 11, note: '措辞', replacement: '本公司的' }, 'reviewer', 1);
-  const m1 = await svc.addAnnotation({ docId: doc.id, kind: 'mask', start: keyStart, end: keyEnd, note: '' }, 'reviewer', 1);
-  ok('三条批注创建成功', c1.id && s1.id && m1.id);
+  const m1 = await svc.maskNod(doc.id, keyStart, keyEnd, R1, 1);
+  ok('两条批注 + 第一次遮罩点头创建成功', c1.id && s1.id && m1.annotation.id);
+  ok('只有一人点头：正文仍可读，且返回 waiting', m1.outcome === 'waiting' && m1.applied === false
+    && (await svc.getDoc(doc.id)).content.includes('ABCDEF'));
+  ok('点头记录带点头人', JSON.stringify(m1.annotation.approvers) === JSON.stringify([R1]));
+
+  // 同一审阅人重复点头：幂等，不算第二人
+  const m1again = await svc.maskNod(doc.id, keyStart, keyEnd, R1, 1);
+  ok('同一人对同一处重复点头不算数', m1again.outcome === 'already-nodded' && m1again.applied === false);
+
+  // 第二位审阅人范围对不上：不点齐，正文不动
+  const mismatch = await svc.maskNod(doc.id, keyStart, keyEnd - 1, R2, 1);
+  ok('两人范围不一致：不点齐', mismatch.outcome === 'waiting' && mismatch.applied === false
+    && (await svc.getDoc(doc.id)).content.includes('ABCDEF'));
 
   console.log('2) 打回批注：原文恢复/不变');
   const contentBefore = (await svc.getDoc(doc.id)).content;
@@ -44,54 +64,68 @@ async function main() {
   const r3 = await svc.resolveAnnotation(doc.id, s1.id, 'accept', 'author', 1);
   ok('建议文字进入原文', r3.doc.content.includes('本公司的'));
   const anns3 = await svc.annotations(doc.id);
-  const m1After = anns3.find(a => a.id === m1.id);
-  ok('遮罩提议跟随到新位置', m1After.start === Array.from(r3.doc.content).indexOf('A'));
-  ok('跟随位置覆盖的仍是 ABCDEF', anns3.find(a => a.id === m1.id).covered === 'ABCDEF');
+  const m1After = anns3.find(a => a.id === m1.annotation.id);
+  ok('遮罩点头跟随到新位置', m1After.start === Array.from(r3.doc.content).indexOf('A'));
+  ok('跟随位置覆盖的仍是 ABCDEF', anns3.find(a => a.id === m1.annotation.id).covered === 'ABCDEF');
 
-  console.log('4) 作者改原文：批注跟随 / 失位不批错行');
+  console.log('4) 作者改原文：普通批注跟随；遮罩点头改到选区内部即作废');
   const doc4 = await svc.getDoc(doc.id);
   const v4 = doc4.version;
   // 在开头插入
   let edited = '【2026版】' + doc4.content;
   const r4 = await svc.editContent(doc.id, edited, 'author', v4);
   let anns4 = await svc.annotations(doc.id);
-  const m1b = anns4.find(a => a.id === m1.id);
-  ok('插入前缀后位置平移', m1b.start === Array.from(r4.content).indexOf('A') && m1b.covered === 'ABCDEF');
-  // 删掉批注覆盖区的一个字符（B）→ 遮罩提议失位
+  const m1b = anns4.find(a => a.id === m1.annotation.id);
+  ok('编辑全在选区外：遮罩点头平移、仍有效', m1b.status === 'proposed'
+    && m1b.start === Array.from(r4.content).indexOf('A') && m1b.covered === 'ABCDEF');
+  // 删掉点头覆盖区的一个字符（B）→ 遮罩点头作废
   const pos = Array.from(r4.content).indexOf('B');
   const chars = Array.from(r4.content);
   const deleted = chars.slice(0, pos).join('') + chars.slice(pos + 1).join('');
   const r4b = await svc.editContent(doc.id, deleted, 'author', r4.version);
   anns4 = await svc.annotations(doc.id);
-  const m1c = anns4.find(a => a.id === m1.id);
-  ok('覆盖区被删 → 失去位置（不批错行）', m1c.status === 'orphaned' && m1c.start === null);
+  const m1c = anns4.find(a => a.id === m1.annotation.id);
+  const m1mis = anns4.find(a => a.id === mismatch.annotation.id);
+  ok('覆盖区被删 → 遮罩点头作废（不能拿旧选区遮新正文）', m1c.status === 'void'
+    && m1c.voidReason === 'content-changed' && m1c.start === null);
+  ok('范围对不上的另一点头同样作废', m1mis.status === 'void' && m1mis.start === null);
   ok('原文确实少了 B', !r4b.content.includes('B'));
+  // 作废后不能“重新定位”旧选区，必须在当前正文上重新点头
+  const aPos0 = Array.from(r4b.content).indexOf('A');
+  const errRepos = await svc.repositionAnnotation(doc.id, m1.annotation.id, aPos0, aPos0 + 5, R1, r4b.version)
+    .then(() => null, e => e);
+  ok('作废的遮罩点头不能重新定位', errRepos && errRepos.status === 400);
 
-  console.log('5) 审阅人重新定位失位遮罩');
+  console.log('5) 作废后两位审阅人在当前正文上重新点头');
   const aPos = Array.from(r4b.content).indexOf('A');
-  await svc.repositionAnnotation(doc.id, m1.id, aPos, aPos + 5, 'reviewer', r4b.version);
-  ok('重新定位成功', (await svc.annotations(doc.id)).find(a => a.id === m1.id).covered === 'ACDEF');
+  const nod1 = await svc.maskNod(doc.id, aPos, aPos + 5, R1, r4b.version);
+  ok('第一次点头：等待第二人', nod1.outcome === 'waiting' && nod1.applied === false);
 
   console.log('6) 遮罩预览（不抹除、不落内容）');
-  const prev = await svc.previewMasks(doc.id, null, 'reviewer');
+  const prev = await svc.previewMasks(doc.id, null, R1);
   ok('预览里密钥被 █ 替代', !prev.preview.includes('ACDEF') && prev.preview.includes('█████'));
   ok('预览不改变正文', (await svc.getDoc(doc.id)).content.includes('ACDEF'));
+  ok('预览带出点头人', JSON.stringify(prev.masks[0].approvers).includes(R1));
 
-  console.log('7) 加一条与遮罩重叠的批注，确认后应封存');
+  console.log('7) 加一条与遮罩重叠的批注，第二人点头点齐后应封存并落盘');
   const doc7 = await svc.getDoc(doc.id);
-  // 第 5 步已把遮罩重新定位到 ACDEF（5 字），在其开头 3 字上划批注
-  const m1pos = (await svc.annotations(doc.id)).find(a => a.id === m1.id);
+  // 重新点头的遮罩覆盖 ACDEF（5 字），在其开头 3 字上划批注
+  const nodPos = (await svc.annotations(doc.id)).find(a => a.id === nod1.annotation.id);
   const overlap = await svc.addAnnotation(
-    { docId: doc.id, kind: 'comment', start: m1pos.start, end: m1pos.start + 3, note: '机密！记得删掉这段里的备注 SECRETNOTE' },
+    { docId: doc.id, kind: 'comment', start: nodPos.start, end: nodPos.start + 3, note: '机密！记得删掉这段里的备注 SECRETNOTE' },
     'reviewer', doc7.version);
-  const conf = await svc.confirmMasks(doc.id, null, 'reviewer', doc7.version);
+  // 第二位审阅人对完全一致的选区点头 → 点齐落盘
+  const conf = await svc.maskNod(doc.id, nodPos.start, nodPos.end, R2, doc7.version);
+  ok('第二人同范围点头：点齐', conf.outcome === 'confirmed' && conf.applied === true);
   const after = await svc.getDoc(doc.id);
-  ok('确认后正文无被遮字符', !after.content.includes('A') && !after.content.includes('CDEF'));
+  ok('点齐后正文无被遮字符', !after.content.includes('A') && !after.content.includes('CDEF'));
   ok('正文里只剩遮罩块占位', util.extractMasks(after.content).length === 1);
   const sealedAnn = (await svc.annotations(doc.id)).find(a => a.id === overlap.id);
   ok('重叠批注被封存', sealedAnn.status === 'sealed' && sealedAnn.note === null && sealedAnn.covered == null && sealedAnn.sealed === true);
   ok('封存批注列表引用里无备注文字', JSON.stringify(await svc.annotations(doc.id)).indexOf('SECRETNOTE') < 0);
   ok('封存批注 id 有返回', conf.sealed.includes(overlap.id));
+  ok('点齐的两条点头记录已删除（不再出现在批注列表）',
+    !(await svc.annotations(doc.id)).some(a => a.id === nod1.annotation.id));
 
   console.log('8) 历史里看不到被遮的字');
   const events = await svc.events(doc.id);
@@ -99,6 +133,8 @@ async function main() {
   ok('历史无密钥字符', !dump.includes('ABCDEF') && !dump.includes('ACDEF') && !dump.includes('SECRETNOTE'));
   const maskEv = events.find(e => e.type === 'mask.confirmed');
   ok('历史只记录遮罩字数', maskEv.detail.len === 5);
+  ok('历史记录两位点头人', maskEv.detail.approvers.length === 2
+    && maskEv.detail.approvers.includes(R1) && maskEv.detail.approvers.includes(R2));
 
   console.log('9) 对外稿：无系统标记、无原文');
   const ext = await svc.external(doc.id);
@@ -144,8 +180,7 @@ async function main() {
   const mContent = '第一段：公开文字甲，内部代号OMEGA七。\n第二段：报价九千万元整。\n第三段：联系方式保密。';
   const master = await svc.createDoc('母稿', mContent, 'author');
   const oPos = cpIndexOf(mContent, 'OMEGA');
-  await svc.addAnnotation({ docId: master.id, kind: 'mask', start: oPos, end: oPos + 5, note: '' }, 'reviewer', 1);
-  await svc.confirmMasks(master.id, null, 'reviewer', 1);
+  await nodBoth(master.id, oPos, oPos + 5, 1);
   const masterDoc = await svc.getDoc(master.id);
   ok('母稿遮罩已确认', masterDoc.content.includes('⟦█████⟧') && !masterDoc.content.includes('OMEGA'));
   const k1 = await svc.deriveDoc(master.id, '', 'author');
@@ -180,8 +215,7 @@ async function main() {
   // 母稿确认遮掉“九千万元”
   const mDoc2 = await svc.getDoc(master.id);
   const m9 = cpIndexOf(mDoc2.content, '九千万元');
-  await svc.addAnnotation({ docId: master.id, kind: 'mask', start: m9, end: m9 + 4, note: '' }, 'reviewer', mDoc2.version);
-  await svc.confirmMasks(master.id, null, 'reviewer', mDoc2.version);
+  await nodBoth(master.id, m9, m9 + 4, mDoc2.version);
   k1After = await svc.getDoc(k1.id);
   k2After = await svc.getDoc(k2.id);
   ok('母稿原文已抹除', !(await svc.getDoc(master.id)).content.includes('九千万元'));
@@ -199,10 +233,9 @@ async function main() {
   // k1 自己遮“乙改”
   const k1Doc2 = await svc.getDoc(k1.id);
   const pj = cpIndexOf(k1Doc2.content, '乙改');
-  await svc.addAnnotation({ docId: k1.id, kind: 'mask', start: pj, end: pj + 2, note: '' }, 'reviewer', k1Doc2.version);
+  await nodBoth(k1.id, pj, pj + 2, k1Doc2.version);
   const mBefore = (await svc.getDoc(master.id)).content;
   const k2Before = (await svc.getDoc(k2.id)).content;
-  await svc.confirmMasks(k1.id, null, 'reviewer', k1Doc2.version);
   ok('k1 自己的遮罩生效', !(await svc.getDoc(k1.id)).content.includes('乙改'));
   ok('派生稿遮罩不写回母稿', (await svc.getDoc(master.id)).content === mBefore);
   ok('另一份投放稿不受影响', (await svc.getDoc(k2.id)).content === k2Before);
@@ -246,8 +279,7 @@ async function main() {
   // 母稿确认遮“见官网” → k2 冻结也必须遮掉
   const mDoc4 = await svc.getDoc(master.id);
   const pg = cpIndexOf(mDoc4.content, '见官网');
-  await svc.addAnnotation({ docId: master.id, kind: 'mask', start: pg, end: pg + 3, note: '' }, 'reviewer', mDoc4.version);
-  await svc.confirmMasks(master.id, null, 'reviewer', mDoc4.version);
+  await nodBoth(master.id, pg, pg + 3, mDoc4.version);
   const k2Frozen = await svc.getDoc(k2.id);
   ok('冻结的投放稿也跟着遮掉', !k2Frozen.content.includes('见官网') && k2Frozen.content.includes('⟦███⟧'));
   const k1After2 = await svc.getDoc(k1.id);
@@ -257,8 +289,7 @@ async function main() {
   const g = await svc.deriveDoc(k1.id, '孙稿', 'author');
   const mDoc5 = await svc.getDoc(master.id);
   const pl = cpIndexOf(mDoc5.content, '联系方式');
-  await svc.addAnnotation({ docId: master.id, kind: 'mask', start: pl, end: pl + 4, note: '' }, 'reviewer', mDoc5.version);
-  await svc.confirmMasks(master.id, null, 'reviewer', mDoc5.version);
+  await nodBoth(master.id, pl, pl + 4, mDoc5.version);
   const gDoc = await svc.getDoc(g.id);
   ok('孙稿级联遮掉同一段', !gDoc.content.includes('联系方式') && gDoc.content.includes('⟦████⟧'));
   ok('孙稿基准版本跟着 k1 走', gDoc.baseVersion === (await svc.getDoc(k1.id)).version);
@@ -290,8 +321,7 @@ async function main() {
   await svc.editContent(kB.id, '兹有内部代号德塔九号，请勿外传。', 'author', 1);
   const mBDoc = await svc.getDoc(mB.id);
   const dPos = cpIndexOf(mBDoc.content, 'DELTA9');
-  await svc.addAnnotation({ docId: mB.id, kind: 'mask', start: dPos, end: dPos + 6, note: '' }, 'reviewer', mBDoc.version);
-  await svc.confirmMasks(mB.id, null, 'reviewer', mBDoc.version);
+  await nodBoth(mB.id, dPos, dPos + 6, mBDoc.version);
   const kBAfter = await svc.getDoc(kB.id);
   ok('投放稿改写过的代号也被遮掉', !kBAfter.content.includes('德塔九号') && kBAfter.content.includes('⟦████⟧'));
   ok('遮罩只盖代号、上下文不动', kBAfter.content === '兹有内部代号⟦████⟧，请勿外传。');
@@ -306,8 +336,7 @@ async function main() {
   const kC = await svc.deriveDoc(mC.id, '投放稿C', 'author');
   const mCDoc = await svc.getDoc(mC.id);
   const firstAlpha = cpIndexOf(mCDoc.content, 'ALPHA'); // 只遮第一处
-  await svc.addAnnotation({ docId: mC.id, kind: 'mask', start: firstAlpha, end: firstAlpha + 5, note: '' }, 'reviewer', mCDoc.version);
-  await svc.confirmMasks(mC.id, null, 'reviewer', mCDoc.version);
+  await nodBoth(mC.id, firstAlpha, firstAlpha + 5, mCDoc.version);
   const kCAfter = await svc.getDoc(kC.id);
   ok('对应的那一处被遮掉', kCAfter.content.includes('代号⟦█████⟧开头'));
   ok('结尾相同的字不被连坐', kCAfter.content.includes('结尾又是ALPHA。'));
@@ -353,8 +382,7 @@ async function main() {
   // (e) 放行后母稿确认新遮罩，已放行那段对应那处也跟着遮；其他相同字不连坐
   const pmDoc = await svc.getDoc(pm.id);
   const nPos = cpIndexOf(pmDoc.content, 'NOVA');
-  await svc.addAnnotation({ docId: pm.id, kind: 'mask', start: nPos, end: nPos + 4, note: '' }, 'reviewer', pmDoc.version);
-  await svc.confirmMasks(pm.id, null, 'reviewer', pmDoc.version);
+  await nodBoth(pm.id, nPos, nPos + 4, pmDoc.version);
   extA = await svc.external(pa.id);
   ok('母稿新遮罩追加到已放行段', !extA.content.includes('NOVA') && extA.content.includes('████'));
   ok('追加遮罩只遮对应那处，上下文不动', extA.content === '二段：代号████八，先放行。');
@@ -374,12 +402,10 @@ async function main() {
   ok('乙只亮乙放的段', extB.content.includes('公开内容甲') && !extB.content.includes('九千万'));
   ok('甲的对外稿不受乙放行影响', (await svc.external(pa.id)).content === extA.content);
 
-  // (h) 投放稿自己确认的遮罩也追加进放行快照
-  let pbDoc = await svc.getDoc(pb.id);
+  // (h) 投放稿自己点齐的遮罩也追加进放行快照
+  const pbDoc = await svc.getDoc(pb.id);
   const jPos = cpIndexOf(pbDoc.content, '公开');
-  await svc.addAnnotation({ docId: pb.id, kind: 'mask', start: jPos, end: jPos + 2, note: '' }, 'reviewer', pbDoc.version);
-  pbDoc = await svc.getDoc(pb.id);
-  await svc.confirmMasks(pb.id, null, 'reviewer', pbDoc.version);
+  await nodBoth(pb.id, jPos, jPos + 2, pbDoc.version);
   const extB2 = await svc.external(pb.id);
   ok('本稿确认遮罩也遮掉已放行段', !extB2.content.includes('公开') && extB2.content.includes('██'));
   ok('本稿遮罩不写回母稿', (await svc.getDoc(pm.id)).content.includes('公开内容甲'));
@@ -420,16 +446,80 @@ async function main() {
   const mMulti = await svc.createDoc('多遮母稿', '代号AAA无关代号BBB无关代号CCC。', 'author');
   const kMulti = await svc.deriveDoc(mMulti.id, '多遮投放稿', 'author');
   await svc.releaseParagraph(kMulti.id, 0, 'author', 1);
-  const mmDoc = await svc.getDoc(mMulti.id);
+  // 每处都由两位审阅人在当前正文的同一坐标上点齐（点齐会改版本并推移后续坐标）
   for (const token of ['AAA', 'BBB', 'CCC']) {
-    const pp = cpIndexOf(mmDoc.content, token);
-    await svc.addAnnotation({ docId: mMulti.id, kind: 'mask', start: pp, end: pp + 3, note: '' }, 'reviewer', mmDoc.version);
+    const cur = await svc.getDoc(mMulti.id);
+    const pp = cpIndexOf(cur.content, token);
+    await nodBoth(mMulti.id, pp, pp + 3, cur.version);
   }
-  await svc.confirmMasks(mMulti.id, null, 'reviewer', mmDoc.version);
   const extMulti = await svc.external(kMulti.id);
   ok('三处都抹对、上下文不动', extMulti.content === '代号███无关代号███无关代号███。');
   const rawMulti = fs.readFileSync(path.join(tmp, 'data.json'), 'utf8');
   ok('落盘无 AAA/BBB/CCC', !rawMulti.includes('AAA') && !rawMulti.includes('BBB') && !rawMulti.includes('CCC'));
+
+  console.log('25) 双人确认制专项：一个人不算 / 边界插入保留 / 内部改动作废 / 普通批注仍可重新定位');
+  // (a) 一个人点头：对外仍能读到；作者账号无权点头
+  const mD = await svc.createDoc('双人稿', '机密SIGMA勿外传，另有机密TAU也保密。', 'author');
+  const d1 = await svc.getDoc(mD.id);
+  const sig = cpIndexOf(d1.content, 'SIGMA');
+  const n1 = await svc.maskNod(mD.id, sig, sig + 5, R1, 1);
+  ok('第一人点头等待中', n1.outcome === 'waiting');
+  ok('只有一人点头：对外稿仍读得到', (await svc.external(mD.id)).content.includes('SIGMA'));
+  const errAuthor = await svc.maskNod(mD.id, sig, sig + 5, 'author', 1).then(() => null, e => e);
+  ok('作者不能点头遮罩', errAuthor && errAuthor.status === 403);
+  // (b) 同一人再点同处也不能变成 2/2
+  const n1b = await svc.maskNod(mD.id, sig, sig + 5, R1, 1);
+  ok('同一人重复点头仍只有 1 人', n1b.outcome === 'already-nodded'
+    && (await svc.external(mD.id)).content.includes('SIGMA'));
+  // (c) 第二人范围对不上（相邻但不同的区间）：不点齐
+  const n2mis = await svc.maskNod(mD.id, sig, sig + 4, R2, 1);
+  ok('范围对不上：仍不点齐', n2mis.applied === false
+    && (await svc.external(mD.id)).content.includes('SIGMA'));
+  // (d) 第二人改划到完全一致的选区 → 点齐（其旧的错误点头仍在，但不影响）
+  const n2ok = await svc.maskNod(mD.id, sig, sig + 5, R2, 1);
+  ok('同一选区两人点齐：落盘', n2ok.outcome === 'confirmed' && n2ok.applied === true
+    && !(await svc.external(mD.id)).content.includes('SIGMA'));
+  // 点齐时与选区重叠的错误点头（sig..sig+4）也被作废清理
+  ok('点齐后无残留待点头遮罩', !(await svc.annotations(mD.id)).some(a => a.kind === 'mask' && a.status === 'proposed'));
+
+  // (e) 一人点头后：作者在选区【边界】插入，点头保留；在选区【内部】改字，立即作废
+  const d2 = await svc.getDoc(mD.id);
+  const tau = cpIndexOf(d2.content, 'TAU');
+  await svc.maskNod(mD.id, tau, tau + 3, R1, d2.version);
+  // 边界（TAU 前面）插入：覆盖的仍是 TAU
+  const vEdge = (await svc.getDoc(mD.id)).version;
+  await svc.editContent(mD.id, d2.content.replace('另有机密TAU', '另有机密XTAU'), 'author', vEdge);
+  const afterEdge = (await svc.annotations(mD.id)).find(a => a.kind === 'mask' && a.status === 'proposed'
+    && a.covered === 'TAU' && a.approvers.includes(R1));
+  ok('选区边界插入：点头保留且仍覆盖 TAU', !!afterEdge);
+  // 内部改字（TAU 中插一个字）→ 点头作废，不能拿旧选区遮新正文
+  const d3 = await svc.getDoc(mD.id);
+  const vInside = d3.version;
+  await svc.editContent(mD.id, d3.content.replace('XTAU', 'XTXAU'), 'author', vInside);
+  const afterInside = (await svc.annotations(mD.id)).find(a => a.id === afterEdge.id);
+  ok('选区内部被改：点头作废', afterInside.status === 'void' && afterInside.voidReason === 'content-changed'
+    && afterInside.start === null);
+  ok('作废后对外仍读到新正文', (await svc.external(mD.id)).content.includes('TXAU'));
+  // 作废后重新双人点头才能遮
+  const d4 = await svc.getDoc(mD.id);
+  const txau = cpIndexOf(d4.content, 'TXAU');
+  await nodBoth(mD.id, txau, txau + 4, d4.version);
+  ok('重新双人点头后才抹掉', !(await svc.external(mD.id)).content.includes('TXAU'));
+
+  // (f) 普通批注失位后仍可重新定位（遮罩不行）
+  const mE = await svc.createDoc('批注稿', '甲乙丙丁戊', 'author');
+  const cc = await svc.addAnnotation({ docId: mE.id, kind: 'comment', start: 1, end: 3, note: '乙丙' }, R1, 1);
+  await svc.editContent(mE.id, '甲X乙丙丁戊', 'author', 1); // 乙丙前插入 → 仍跟随
+  let ccView = (await svc.annotations(mE.id)).find(a => a.id === cc.id);
+  ok('普通批注边界插入后跟随', ccView.status === 'proposed' && ccView.covered === '乙丙');
+  await svc.editContent(mE.id, '甲X乙丁戊', 'author', (await svc.getDoc(mE.id)).version); // 删掉丙
+  ccView = (await svc.annotations(mE.id)).find(a => a.id === cc.id);
+  ok('覆盖字被删：普通批注失位（不猜位置）', ccView.status === 'orphaned' && ccView.start === null);
+  const eCur = await svc.getDoc(mE.id);
+  const bing = cpIndexOf(eCur.content, '乙');
+  await svc.repositionAnnotation(mE.id, cc.id, bing, bing + 1, R2, eCur.version);
+  ccView = (await svc.annotations(mE.id)).find(a => a.id === cc.id);
+  ok('普通批注可由审阅人重新定位', ccView.status === 'proposed' && ccView.covered === '乙');
 
   console.log(`\n全部通过：${passed} 项断言`);
 }

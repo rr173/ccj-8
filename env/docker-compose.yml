@@ -7,9 +7,10 @@ services:
     ports:
       - "8080:8080"
     environment:
-      # 生产部署请务必修改下面两个密码
+      # 生产部署请务必修改下面三个密码（reviewer / reviewer2 必须是两个不同的人）
       AUTHOR_PASSWORD: "${AUTHOR_PASSWORD:-author123}"
       REVIEWER_PASSWORD: "${REVIEWER_PASSWORD:-reviewer123}"
+      REVIEWER2_PASSWORD: "${REVIEWER2_PASSWORD:-${REVIEWER_PASSWORD:-reviewer123}}"
       DATA_FILE: /data/review.json
     volumes:
       - review-data:/data

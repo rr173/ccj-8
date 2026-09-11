@@ -18,13 +18,14 @@ app.use(express.json({ limit: '2mb' }));
 const store = new JsonStore(DATA_FILE);
 const service = new Service(store);
 
-// 首次启动从环境变量初始化两个账号；未提供则用默认值并在日志提示尽快改密码
+// 首次启动从环境变量初始化三个账号（作者 + 两名审阅人）；未提供则用默认值并在日志提示尽快改密码
 const AUTHOR_PW = process.env.AUTHOR_PASSWORD || 'author123';
 const REVIEWER_PW = process.env.REVIEWER_PASSWORD || 'reviewer123';
+const REVIEWER2_PW = process.env.REVIEWER2_PASSWORD || process.env.REVIEWER_PASSWORD || 'reviewer123';
 let SECRET = null;
 
 async function boot() {
-  SECRET = await service.initUsers(AUTHOR_PW, REVIEWER_PW);
+  SECRET = await service.initUsers(AUTHOR_PW, REVIEWER_PW, REVIEWER2_PW);
 }
 
 // ---------- 认证 ----------
@@ -171,11 +172,19 @@ app.post('/api/docs/:id/masks/preview', requireAuth(['reviewer']), async (req, r
   catch (e) { next(e); }
 });
 
-app.post('/api/docs/:id/masks/confirm', requireAuth(['reviewer']), async (req, res, next) => {
+// 遮罩点头（双人确认制）：同一处选区需两个不同审阅人各点一次，范围完全一致才生效
+app.post('/api/docs/:id/masks/nod', requireAuth(['reviewer']), async (req, res, next) => {
   try {
-    res.json(await service.confirmMasks(
-      req.params.id, Array.isArray(req.body.ids) ? req.body.ids : null, req.user.name, req.body.version));
+    const r = await service.maskNod(
+      req.params.id, Number(req.body.start), Number(req.body.end), req.user.name, req.body.version);
+    res.status(r.applied ? 200 : 201).json(r);
   } catch (e) { next(e); }
+});
+
+// 旧的单人确认接口已下线：一个人说了不算
+app.post('/api/docs/:id/masks/confirm', requireAuth(['reviewer']), (req, res) => {
+  void req;
+  res.status(410).json({ error: '遮罩改为双人确认：请两位审阅人分别在同一处选区点头（/masks/nod）' });
 });
 
 app.use((err, req, res, next) => {
@@ -194,8 +203,8 @@ boot().then(() => {
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`文案审阅服务已启动: http://0.0.0.0:${PORT}`);
     console.log(`数据文件: ${DATA_FILE}`);
-    if (!process.env.AUTHOR_PASSWORD || !process.env.REVIEWER_PASSWORD) {
-      console.log('使用了默认密码（author123 / reviewer123），生产环境请用环境变量覆盖。');
+    if (!process.env.AUTHOR_PASSWORD || !process.env.REVIEWER_PASSWORD || !process.env.REVIEWER2_PASSWORD) {
+      console.log('使用了默认密码（author123 / reviewer123 / reviewer2 默认同 REVIEWER_PASSWORD 或 reviewer123），生产环境请用环境变量覆盖。');
     }
   });
 }).catch(e => { console.error(e); process.exit(1); });

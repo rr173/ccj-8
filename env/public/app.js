@@ -67,8 +67,8 @@ $('#loginBtn').onclick = async () => {
   $('#loginErr').textContent = '';
   try {
     const username = $('#loginUser').value;
-    await api('POST', '/api/login', { username, password: $('#loginPw').value });
-    state.me = { username, role: username === 'author' ? 'author' : 'reviewer' };
+    const me = await api('POST', '/api/login', { username, password: $('#loginPw').value });
+    state.me = { username: me.username, role: me.role };
     await showList();
   } catch (e) { $('#loginErr').textContent = e.message; }
 };
@@ -334,13 +334,25 @@ function renderContent() {
   }
 
   host.onclick = e => {
-    const annEl = e.target.closest('.ann, .mask-pending');
+    const maskEl = e.target.closest('.mask-pending');
+    if (maskEl) {
+      maskEl.classList.add('active');
+      openMaskAnnotation(maskEl.dataset.ann);
+      return;
+    }
+    const annEl = e.target.closest('.ann');
     if (annEl) {
       $$('#contentRender .ann.active').forEach(x => x.classList.remove('active'));
       annEl.classList.add('active');
       openAnnotation(annEl.dataset.ann);
     }
   };
+}
+
+// 点击正文上的遮罩高亮：滚动到侧栏对应点头卡片
+function openMaskAnnotation(id) {
+  const el = document.querySelector(`.mask-item[data-id="${id}"]`);
+  el?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
 // 选区 -> content 坐标
@@ -427,8 +439,36 @@ function handleSelection() {
 }
 function hidePop() { $('#selectPop').classList.add('hidden'); }
 $('#selectPop').querySelectorAll('button[data-kind]').forEach(btn => {
-  btn.onclick = () => openCreateModal(btn.dataset.kind);
+  btn.onclick = () => {
+    if (btn.dataset.kind === 'mask') return submitMaskNod();
+    openCreateModal(btn.dataset.kind);
+  };
 });
+
+// 遮罩 = 一次“点头”：必须两位审阅人在同一处选区各点一次、范围完全一致才生效。
+async function submitMaskNod() {
+  const { start, end, text } = state.selection;
+  if (!confirm(
+    `对选中的 ${end - start} 字点头遮罩？\n\n「${text.slice(0, 30)}${text.length > 30 ? '…' : ''}」\n\n` +
+    '注意：一处不可逆遮罩必须由【两位不同的审阅人】各自在【完全一致的选区】上点头才算确认；\n' +
+    '只有一个人点头时，这些字对外仍能读到。点头后若作者改动了这段字，本次点头立即作废。')) return;
+  try {
+    const r = await api('POST', `/api/docs/${state.doc.id}/masks/nod`,
+      { start, end, version: state.doc.version });
+    hidePop(); window.getSelection().removeAllRanges();
+    if (r.outcome === 'confirmed') {
+      toast(`两位审阅人已点齐，${end - start} 字已永久遮罩${r.sealed && r.sealed.length ? `，封存批注 ${r.sealed.length} 条` : ''}`);
+    } else if (r.outcome === 'already-nodded') {
+      toast('你已经对这处选区点过头，等待另一位审阅人点头');
+    } else {
+      toast('已记录你的点头（1/2）；等待另一位审阅人在完全一致的选区上点头');
+    }
+    await reloadDoc();
+  } catch (e) {
+    if (e.status === 409) { toast(e.message); await reloadDoc(); }
+    else toast(e.message);
+  }
+}
 document.addEventListener('mousedown', e => {
   if (!e.target.closest('#selectPop') && !e.target.closest('#contentRender')) hidePop();
 });
@@ -448,15 +488,14 @@ async function doReposition() {
 // ---------- 新建批注弹层 ----------
 function openCreateModal(kind) {
   const { start, end, text } = state.selection;
-  const titles = { comment: '加批注（可逆）', suggest: '提修改建议（作者可接受/打回）', mask: '划遮罩（确认后不可逆）' };
-  $('#annModalTitle').textContent = titles[kind];
+  const titles = { comment: '加批注（可逆）', suggest: '提修改建议（作者可接受/打回）' };
+  $('#annModalTitle').textContent = titles[kind] || '批注';
   $('#annModalBody').innerHTML = `
     <div class="quote">${esc(text)}</div>
     ${kind === 'comment' ? '<textarea id="m_note" rows="4" placeholder="批注意见…"></textarea>' : ''}
     ${kind === 'suggest' ? `
       <label>批注说明（可选）<input id="m_note" maxlength="2000"></label>
       <label>建议替换为<textarea id="m_repl" rows="4">${esc(text)}</textarea></label>` : ''}
-    ${kind === 'mask' ? '<div class="warn">此操作只是“提议”。随后必须在右侧“不可逆遮罩”里预览并确认，才会真正抹除。</div>' : ''}
   `;
   $('#annModal').classList.remove('hidden');
   $('#annModalOk').onclick = async () => {
@@ -591,68 +630,79 @@ async function releaseParagraph(p) {
 }
 
 // ---------- 遮罩侧栏 ----------
+const MASK_STATUS_TEXT = {
+  proposed: '待双人点头',
+  void: '点头已作废',
+};
 function renderMaskCard() {
   const host = $('#maskList');
   const masks = state.annotations.filter(a => a.kind === 'mask');
   const isReviewer = state.me.role === 'reviewer';
   $('#maskCard').classList.toggle('hidden', !isReviewer);
-  if (!masks.length) { host.innerHTML = '<p class="hint">暂无待确认遮罩。</p>'; return; }
-  host.innerHTML = masks.map(a => {
-    if (a.status === 'orphaned') {
-      return `<div class="mask-item" data-id="${a.id}"><b>遮罩提议已失去位置</b>
-        <p class="hint">原文被改动，请重新选定位置。</p>
-        <button class="act-mask-repos" data-id="${a.id}">重新定位</button></div>`;
+  const active = masks.filter(a => a.status === 'proposed' && a.start !== null);
+  const voided = masks.filter(a => a.status === 'void');
+  if (!masks.length) { host.innerHTML = '<p class="hint">暂无遮罩点头。在正文上拖选文字后点“划遮罩”。</p>'; return; }
+  const items = active.map(a => {
+    const approvers = a.approvers || [];
+    const iNodded = approvers.includes(state.me.username);
+    let statusLine;
+    if (approvers.length >= 2) {
+      statusLine = `<span class="badge accepted">已点齐</span>`;
+    } else {
+      const otherOnOverlap = active.some(b => b.id !== a.id &&
+        b.start < a.end && b.end > a.start && !(b.approvers || []).includes(a.author));
+      statusLine = otherOnOverlap
+        ? '<span class="badge rejected">另一人范围对不上，不算点齐</span>'
+        : '<span class="badge proposed">1/2，等待第二位审阅人</span>';
     }
-    return `<div class="mask-item" data-id="${a.id}">
-      <b>待确认遮罩 · ${a.end - a.start} 字</b>
-      <div class="hint">${fmtTime(a.createdAt)} 提议；确认后此段文字永久抹除</div></div>`;
-  }).join('');
-  host.querySelectorAll('.act-mask-repos').forEach(b => b.onclick = () => resolveAction(b.dataset.id, 'reposition'));
+    return `<div class="mask-item ${iNodded ? 'mine' : ''}" data-id="${a.id}">
+      <b>遮罩点头 · ${a.end - a.start} 字</b>
+      <div class="meta">${statusLine}</div>
+      <div class="quote">${esc(a.covered || '')}</div>
+      <div class="hint">点头人：${approvers.map(esc).join('、') || '—'} · ${fmtTime(a.createdAt)}</div>
+      ${iNodded ? '<div class="hint">你已点过头；另一位审阅人需在完全一致的选区上点头。</div>'
+        : '<div class="hint">你还没点：在正文上对同一处文字拖选并“划遮罩”即可点头。</div>'}
+    </div>`;
+  });
+  const voidItems = voided.map(a => {
+    const reason = a.voidReason === 'content-changed'
+      ? '作者在点头后改动了这段字，点头作废，不能拿旧选区遮现在的正文。'
+      : a.voidReason === 'mask-overlap'
+        ? '这处选区与已确认的遮罩重叠，点头作废。'
+        : '同一审阅人重新划了选区，旧点头作废。';
+    return `<div class="mask-item void" data-id="${a.id}">
+      <b>遮罩点头已作废（${a.maskLen != null ? a.maskLen : '?'} 字）</b>
+      <p class="hint">${reason}如仍需遮罩，请在当前正文上重新拖选、重新点头。</p>
+    </div>`;
+  });
+  host.innerHTML = items.join('') + voidItems.join('');
 }
 
-// ---------- 遮罩预览/确认 ----------
+// ---------- 遮罩预览（只读：真正的确认是第二位审阅人点头） ----------
 $('#previewMaskBtn').onclick = async () => openMaskPreview();
 
 async function openMaskPreview(ids) {
   try {
     const r = await api('POST', `/api/docs/${state.doc.id}/masks/preview`,
       { ids: ids || null });
-    if (!r.masks.length) { toast('没有待确认的遮罩提议'); return; }
+    if (!r.masks.length) { toast('还没有任何遮罩点头'); return; }
     $('#maskPreview').innerHTML = renderExternalHtml(r.preview);
     $('#maskChecks').innerHTML = r.masks.map(m => `
-      <label style="display:flex;gap:8px;align-items:center">
-        <input type="checkbox" class="mask-check" value="${m.id}" checked style="width:auto">
-        遮罩段 ${m.id}（${m.len} 字，位置 ${m.start}–${m.end}）
-      </label>`).join('');
+      <div style="display:flex;gap:8px;align-items:center">
+        <span class="badge ${(m.approvers || []).length >= 2 ? 'accepted' : 'proposed'}">
+          ${(m.approvers || []).length}/2</span>
+        遮罩段（${m.len} 字，位置 ${m.start}–${m.end}）· 点头人：${esc((m.approvers || []).join('、') || '—')}
+      </div>`).join('');
     const sealWarn = $('#maskSealWarn');
     if (r.seal.length) {
       sealWarn.classList.remove('hidden');
-      sealWarn.textContent = `注意：有 ${r.seal.length} 条批注与遮罩选区重叠，确认后这些批注的内容将一并永久封存（只保留“某条批注被封存”的记录）。`;
+      sealWarn.textContent = `注意：有 ${r.seal.length} 条批注与遮罩选区重叠，点齐落盘后这些批注的内容将一并永久封存（只保留“某条批注被封存”的记录）。`;
     } else sealWarn.classList.add('hidden');
+    $('#maskPreviewHint').textContent = '这是所有待点头选区全部点齐后的对外效果预览，不会改动正文。';
     $('#maskModal').classList.remove('hidden');
-    $('#maskChecks').querySelectorAll('.mask-check').forEach(c => c.onchange = async () => {
-      const checked = [...$$('#maskChecks .mask-check')].filter(x => x.checked).map(x => x.value);
-      if (!checked.length) { $('#maskPreview').textContent = '（未勾选任何遮罩）'; return; }
-      const rr = await api('POST', `/api/docs/${state.doc.id}/masks/preview`, { ids: checked });
-      $('#maskPreview').innerHTML = renderExternalHtml(rr.preview);
-    });
   } catch (e) { toast(e.message); }
 }
 $('#maskModalCancel').onclick = () => $('#maskModal').classList.add('hidden');
-$('#maskModalOk').onclick = async () => {
-  const ids = [...$$('#maskChecks .mask-check')].filter(x => x.checked).map(x => x.value);
-  if (!ids.length) { toast('请至少勾选一段'); return; }
-  if (!confirm(`确认对 ${ids.length} 段执行不可逆遮罩？\n\n确认后被遮的字立即从正文和历史中抹除，作者和审阅人都永远无法再读出，无法撤销。`)) return;
-  try {
-    const r = await api('POST', `/api/docs/${state.doc.id}/masks/confirm`, { ids, version: state.doc.version });
-    $('#maskModal').classList.add('hidden');
-    toast(`已永久遮罩 ${ids.length} 段${r.sealed.length ? `，封存批注 ${r.sealed.length} 条` : ''}`);
-    await reloadDoc();
-  } catch (e) {
-    if (e.status === 409) { toast(e.message); await reloadDoc(); }
-    else toast(e.message);
-  }
-};
 
 // ---------- 作者改原文 ----------
 $('#saveContentBtn').onclick = async () => {
@@ -683,7 +733,13 @@ const EVENT_TEXT = {
   'comment.rejected': '作者打回了一条批注，原文保持不变',
   'suggest.accepted': '作者接受修改建议，原文已替换',
   'suggest.rejected': '作者打回修改建议，原文保持不变',
-  'mask.confirmed': d => `确认不可逆遮罩 ${d.len} 字（原文已抹除，历史不保留被遮内容）`,
+  'mask.nodded': d => `审阅人对 ${d.len} 字的遮罩点了一次头（待第二位审阅人在同一选区点头；未点齐不抹字）`,
+  'mask.confirmed': d => `两位审阅人已点齐，确认不可逆遮罩 ${d.len} 字（${((d.approvers || []).join('、')) || ''}；原文已抹除，历史不保留被遮内容）`,
+  'mask.voided': d => d.reason === 'content-changed'
+    ? '作者改动了这段字：此前的遮罩点头作废，不能拿旧选区遮现在的正文（需重新点头）'
+    : d.reason === 'mask-overlap'
+      ? '一处遮罩点头因与已确认遮罩重叠而作废'
+      : '审阅人改划了选区：旧遮罩点头作废',
   'mask.synced': d => `随母稿确认遮罩，本稿同步遮罩 ${d.len} 字${d.count > 1 ? `（${d.count} 处）` : ''}（原文已抹除）`,
   'annotation.sealed': '一条批注因与遮罩重叠被永久封存',
   'paragraph.released': d => `作者放行第 ${(d.paragraph || 0) + 1} 段（外面只能看到放行时遮完后的字；不可收回）`,

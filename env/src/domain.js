@@ -19,17 +19,24 @@ class Service {
   }
 
   // ---------- 初始化 ----------
-  async initUsers(authorPw, reviewerPw) {
+  // 两名审阅人：不可逆遮罩必须由两个不同的审阅人各自点头，一个人说了不算。
+  async initUsers(authorPw, reviewerPw, reviewer2Pw) {
     await this.store.tx(d => {
       if (!d.secret) d.secret = randomToken();
       if (!d.users.author) d.users.author = { passHash: hashPassword(authorPw), role: 'author' };
       if (!d.users.reviewer) d.users.reviewer = { passHash: hashPassword(reviewerPw), role: 'reviewer' };
+      if (!d.users.reviewer2) d.users.reviewer2 = { passHash: hashPassword(reviewer2Pw), role: 'reviewer' };
     });
     return this.store.read(d => d.secret);
   }
 
   getUser(username) {
     return this.store.read(d => d.users[username] || null);
+  }
+
+  // actor 是用户名；遮罩/批注权限看角色（reviewer / reviewer2 都是审阅人）
+  _isReviewer(d, actor) {
+    return !!(d.users[actor] && d.users[actor].role === 'reviewer');
   }
 
   _event(d, type, actor, docId, detail = {}) {
@@ -185,7 +192,7 @@ class Service {
 
   // 某段新增遮罩后，把对应位置从该份所有放行记录里一并抹除（同一事务内完成，
   // 事件只记字数）。每次遮罩要抹三处，保证被遮的字在落盘文件里也无处可寻：
-  //   1) doc.content（由调用方 _maskRangeInDoc / confirmMasks 完成）；
+  //   1) doc.content（由调用方 _maskRangeInDoc / _applyConfirmedMasks 完成）；
   //   2) 每条放行的对外快照 anchor（外面能看到的字）；
   //   3) 每条放行保存的“放行时整篇正文”releaseBase（位置映射用，也不能留原文）。
   // 两层宽松映射保证改过的段也逃不掉：
@@ -404,6 +411,17 @@ class Service {
       resolvedBy: a.resolvedBy || null, resolvedAt: a.resolvedAt || null,
       maskLen: a.maskLen || null,
     };
+    if (a.kind === 'mask') {
+      // 遮罩提议只暴露“谁在这处点了头”，绝不暴露被遮文字（covered 仍由正文实时截取）
+      return {
+        ...base,
+        note: '', replacement: null,
+        nods: (a.nods || []).map(n => ({ by: n.by, at: n.at })),
+        approvers: (a.nods || []).map(n => n.by),
+        voidReason: a.voidReason || null,
+        covered: (a.start !== null && doc) ? codePoints(doc.content).slice(a.start, a.end).join('') : null,
+      };
+    }
     if (a.status === 'sealed') {
       // 封存：只能看到这里曾有一条批注，正文/替换文/备注全部不可见
       return { ...base, note: null, replacement: null, sealed: true, sealedReason: a.sealedReason || 'mask-overlap' };
@@ -434,11 +452,10 @@ class Service {
 
   // ---------- 创建批注（评论 / 修改建议 / 遮罩提议） ----------
   async addAnnotation({ docId, kind, start, end, note, replacement }, actor, expectedVersion) {
-    if (!['comment', 'suggest', 'mask'].includes(kind)) throw httpError(400, '批注类型错误');
-    if (kind === 'mask' && actor !== 'reviewer') throw httpError(403, '只有审阅人可以发起遮罩');
-    if (kind !== 'mask' && actor !== 'reviewer') throw httpError(403, '只有审阅人可以添加批注');
+    if (!['comment', 'suggest'].includes(kind)) throw httpError(400, '批注类型错误（遮罩请用双人点头接口 /masks/nod）');
     if (note && note.length > 2000) throw httpError(400, '备注过长');
     return this.store.tx(d => {
+      if (!this._isReviewer(d, actor)) throw httpError(403, '只有审阅人可以添加批注');
       const doc = d.docs[docId];
       if (!doc) throw httpError(404, '文档不存在');
       this._assertOpen(doc);
@@ -447,16 +464,7 @@ class Service {
       for (const m of extractMasks(doc.content)) {
         if (start < m.end && end > m.start) throw httpError(400, '选区与已确认遮罩重叠');
       }
-      const anns = Object.values(d._ann || {}).filter(a => a.docId === docId);
-      if (kind === 'mask') {
-        for (const a of anns) {
-          if (a.kind === 'mask' && a.status === 'proposed' && a.start !== null &&
-              start < a.end && end > a.start) {
-            throw httpError(400, '与待确认的遮罩提议重叠');
-          }
-        }
-        if (end - start < 1) throw httpError(400, '遮罩至少覆盖 1 个字');
-      } else if (kind === 'suggest') {
+      if (kind === 'suggest') {
         if (typeof replacement !== 'string') throw httpError(400, '修改建议需要替换文本');
         if (replacement.length > 10000) throw httpError(400, '替换文本过长');
         if (replacement.includes(MARK) || replacement.includes(MARK_END)) {
@@ -470,7 +478,6 @@ class Service {
         start, end, version: doc.version,
         note: note || '',
         replacement: kind === 'suggest' ? replacement : null,
-        maskLen: kind === 'mask' ? end - start : null,
         author: actor, createdAt: new Date().toISOString(),
       };
       d._ann[id] = ann;
@@ -482,11 +489,12 @@ class Service {
 
   // 审阅人改选区位（批注被作者改文冲掉后，重新指到正确位置）
   async repositionAnnotation(docId, annId, start, end, actor, expectedVersion) {
-    if (actor !== 'reviewer') throw httpError(403, '只有审阅人可以重新定位批注');
     return this.store.tx(d => {
+      if (!this._isReviewer(d, actor)) throw httpError(403, '只有审阅人可以重新定位批注');
       const doc = d.docs[docId];
       const a = d._ann && d._ann[annId];
       if (!doc || !a || a.docId !== docId) throw httpError(404, '批注不存在');
+      if (a.kind === 'mask') throw httpError(400, '遮罩点头已随改文作废，不能移动旧选区；请在当前正文上重新划遮罩点头');
       this._assertOpen(doc);
       this._assertVersion(doc, expectedVersion);
       if (!['proposed', 'orphaned'].includes(a.status)) throw httpError(409, '该批注已结束，不能移动');
@@ -577,6 +585,20 @@ class Service {
       if (a.status !== 'proposed' && a.status !== 'orphaned') continue;
       if (a.start === null) continue;
       const m = mapRange(a.start, a.end, ops);
+      if (a.kind === 'mask') {
+        // 遮罩点头是双人不可逆授权：作者改过这段字（选区内部有任何增/删/改），
+        // 点头立即作废——绝不能拿改之前的选区去遮现在的正文（否则会遮住审阅人
+        // 没看过的新字、或对错位置）。只有选区整体平移（编辑全在边界外、或仅
+        // 贴边界插入）才保留，并按 diff 移到新坐标。
+        if (m.status === 'orphaned' || !this._maskRangeUntouched(a.start, a.end, ops)) {
+          a.start = null; a.end = null;
+          a.status = 'void'; a.voidReason = 'content-changed';
+          this._event(d, 'mask.voided', a.author, doc.id, { annotation: a.id, reason: 'content-changed' });
+        } else {
+          a.start = m.start; a.end = m.end; a.version = doc.version + 1;
+        }
+        continue;
+      }
       if (m.status === 'orphaned') {
         a.start = null; a.end = null; a.status = 'orphaned';
         this._event(d, 'annotation.orphaned', a.author, doc.id, { annotation: a.id });
@@ -586,10 +608,26 @@ class Service {
     }
   }
 
+  // 遮罩选区 [start,end) 内部是否“一个字都没被动过”：
+  //  - delete/replace 的旧文本跨度只要与选区相交（i2>start && i1<end）即被动过；
+  //  - insert 落在选区严格内部（start < i1 < end）也算动过——新字会被旧选区误遮；
+  //    恰好贴在 start/end 边界上的插入不影响选区覆盖的那串字，允许保留。
+  _maskRangeUntouched(start, end, ops) {
+    for (const [tag, i1, i2] of ops) {
+      if (tag === 'equal') continue;
+      if (tag === 'insert') {
+        if (i1 > start && i1 < end) return false;
+      } else if (i2 > start && i1 < end) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   // ---------- 遮罩预览（不落盘、不记录） ----------
   async previewMasks(docId, ids /* null=全部待确认 */, actor) {
-    if (actor !== 'reviewer') throw httpError(403, '只有审阅人可以预览遮罩');
     return this.store.read(d => {
+      if (!this._isReviewer(d, actor)) throw httpError(403, '只有审阅人可以预览遮罩');
       const doc = d.docs[docId];
       if (!doc) throw httpError(404, '文档不存在');
       const anns = Object.values(d._ann || {}).filter(a =>
@@ -610,60 +648,134 @@ class Service {
         .map(a => ({ id: a.id, kind: a.kind, status: a.status }));
       return {
         preview,
-        masks: anns.map(a => ({ id: a.id, start: a.start, end: a.end, len: a.end - a.start })),
+        masks: anns.map(a => ({
+          id: a.id, start: a.start, end: a.end, len: a.end - a.start,
+          approvers: (a.nods || []).map(n => n.by),
+        })),
         seal: affected,
       };
     });
   }
 
-  // ---------- 确认遮罩（不可逆） ----------
-  async confirmMasks(docId, ids /* null=全部待确认 */, actor, expectedVersion) {
-    if (actor !== 'reviewer') throw httpError(403, '只有审阅人可以确认遮罩');
+  // ---------- 遮罩点头（双人确认制） ----------
+  // 不可逆遮罩不能一个人说了算：审阅人在当前正文上划一处选区 = 一次“点头”。
+  //   - 同一处必须有【两个不同审阅人】、且两人选区【完全一致】，遮罩才在本次
+  //     点头的同一事务里落盘生效；只有一个人点过 / 两人范围对不上，正文一个字
+  //     都不动，对外仍能读到。
+  //   - 一个人已经点了之后，作者改了这段字：该点头立即作废（_remapActive 处理），
+  //     不能拿改之前的选区来遮现在的正文；作废后需对当前正文重新划、重新点。
+  async maskNod(docId, start, end, actor, expectedVersion) {
     return this.store.tx(d => {
+      if (!this._isReviewer(d, actor)) throw httpError(403, '只有审阅人可以点头遮罩');
       const doc = d.docs[docId];
       if (!doc) throw httpError(404, '文档不存在');
       this._assertOpen(doc);
       this._assertVersion(doc, expectedVersion);
-      const anns = Object.values(d._ann || {}).filter(a =>
-        a.docId === docId && a.kind === 'mask' && a.status === 'proposed' && a.start !== null &&
-        (!ids || ids.includes(a.id)));
-      if (!anns.length) throw httpError(400, '没有可确认的遮罩提议');
+      this._checkRange(doc, start, end);
+      if (end - start < 1) throw httpError(400, '遮罩至少覆盖 1 个字');
+      for (const m of extractMasks(doc.content)) {
+        if (start < m.end && end > m.start) throw httpError(400, '选区与已确认遮罩重叠');
+      }
+      const nowIso = new Date().toISOString();
+      const pending = Object.values(d._ann || {}).filter(a =>
+        a.docId === docId && a.kind === 'mask' && a.status === 'proposed' && a.start !== null);
 
-      // 从后往前把正文文字换成遮罩块
-      const preMaskContent = doc.content;
-      let content = preMaskContent;
-      const sealed = [];
-      const maskedRanges = []; // 被遮区段（遮罩前正文坐标）：只活在本事务内存里用于同步投放稿，不落盘
-      const sorted = [...anns].sort((x, y) => y.start - x.start);
-      for (const a of sorted) {
-        const chars = codePoints(content);
-        maskedRanges.push({ start: a.start, end: a.end });
-        const block = maskBlock(a.end - a.start);
-        const next = chars.slice(0, a.start).join('') + block + chars.slice(a.end).join('');
-        const ops = contentOpcodes(content, next);
-        // 遮罩提议本身删除：历史里不保留它的选区文字，只留“遮罩 N 字”事件
-        delete d._ann[a.id];
-        this._sealAndRemap(d, doc, ops, a.start, a.start + cpLen(block), actor, sealed);
-        content = next;
-        this._event(d, 'mask.confirmed', actor, docId, { len: a.end - a.start });
+      // 同一审阅人对同一处重复点头：幂等返回，不算第二人
+      const mine = pending.find(a => a.author === actor && a.start === start && a.end === end);
+      if (mine) {
+        return { doc: this._docView(d, doc), annotation: this._publicAnnotation(d, docId, mine),
+          outcome: 'already-nodded', applied: false };
       }
 
-      doc.content = content;
-      doc.version += 1;
-      doc.updatedAt = new Date().toISOString();
-      // 本稿自己确认的遮罩：从已放行段的对外快照里抹掉（外面只能更少），
-      // 并把被遮文字从放行记录保存的放行时刻正文中物理抹除（落盘不留原文）。
-      this._scrubReleases(d, doc, preMaskContent, maskedRanges, actor, null);
-      // 母稿确认的遮罩：所有已派生的投放稿跟着把对应的那一处遮掉（只向下传播，绝不写回）
-      this._propagateMasks(d, doc, preMaskContent, maskedRanges, actor);
-      return { doc: this._docView(d, doc), sealed };
+      // 另一个审阅人已就【完全一致】的选区点过头 → 点齐，本事务内立即不可逆遮罩
+      const mate = pending.find(a => a.author !== actor && a.start === start && a.end === end);
+      if (mate) {
+        const nods = [
+          { by: mate.author, at: mate.createdAt },
+          { by: actor, at: nowIso },
+        ];
+        const len = end - start;
+        const result = this._applyConfirmedMasks(d, doc, [{ start, end, nods }], actor);
+        this._event(d, 'mask.confirmed', actor, docId, { len, approvers: nods.map(n => n.by) });
+        return { ...result, outcome: 'confirmed', applied: true };
+      }
+
+      // 没有点齐：登记/刷新本审阅人的点头，正文一字不动（外面照常读得到）
+      const myOther = pending.find(a => a.author === actor && start < a.end && end > a.start);
+      let ann;
+      if (myOther) {
+        // 同一审阅人改划了与自己旧点头重叠的范围：旧点头撤下、以新选区为准
+        myOther.start = null; myOther.end = null;
+        myOther.status = 'void'; myOther.voidReason = 'superseded';
+        this._event(d, 'mask.voided', actor, docId, { annotation: myOther.id, reason: 'superseded' });
+      }
+      d._ann = d._ann || {};
+      const id = 'ann_' + (++d.counters.ann);
+      ann = {
+        id, docId, kind: 'mask', status: 'proposed',
+        start, end, version: doc.version,
+        note: '', replacement: null, maskLen: end - start,
+        author: actor, createdAt: nowIso,
+        nods: [{ by: actor, at: nowIso }],
+      };
+      d._ann[id] = ann;
+      this._event(d, 'mask.nodded', actor, docId, { annotation: id, len: end - start });
+      return { doc: this._docView(d, doc), annotation: this._publicAnnotation(d, docId, ann),
+        outcome: 'waiting', applied: false };
     });
+  }
+
+  // 把【已经由两个不同审阅人点齐】的遮罩选区落盘：正文文字换成遮罩块、
+  // 重叠批注封存、放行快照/母稿传播同步抹除。只在此事务内存中使用选区，不落盘原文。
+  _applyConfirmedMasks(d, doc, confirmed /* [{start,end,nods}] */, actor) {
+    const preMaskContent = doc.content;
+    let content = preMaskContent;
+    const sealed = [];
+    const maskedRanges = [];
+    const sorted = [...confirmed].sort((x, y) => y.start - x.start);
+    for (const c of sorted) {
+      const chars = codePoints(content);
+      maskedRanges.push({ start: c.start, end: c.end });
+      const block = maskBlock(c.end - c.start);
+      const next = chars.slice(0, c.start).join('') + block + chars.slice(c.end).join('');
+      const ops = contentOpcodes(content, next);
+      // 点齐的两条遮罩提议删除：历史里不保留选区文字，只留“遮罩 N 字 / 谁点的头”
+      for (const a of Object.values(d._ann || {}).filter(x =>
+        x.docId === doc.id && x.kind === 'mask' && x.status === 'proposed' && x.start !== null &&
+        x.start === c.start && x.end === c.end)) {
+        delete d._ann[a.id];
+      }
+      this._sealAndRemap(d, doc, ops, c.start, c.start + cpLen(block), actor, sealed);
+      content = next;
+    }
+
+    doc.content = content;
+    doc.version += 1;
+    doc.updatedAt = new Date().toISOString();
+    this._scrubReleases(d, doc, preMaskContent, maskedRanges, actor, null);
+    this._propagateMasks(d, doc, preMaskContent, maskedRanges, actor);
+    return { doc: this._docView(d, doc), sealed };
   }
 
   // 遮罩块落进正文后：与块重叠/被吞掉的批注一律封存（备注/替换文清空），
   // 其余批注按 diff 重定位。确认遮罩与母稿同步遮罩共用这一套。
   _sealAndRemap(d, doc, ops, blockStart, blockEnd, actor, sealedOut) {
     for (const other of Object.values(d._ann || {}).filter(x => x.docId === doc.id)) {
+      if (other.kind === 'mask') {
+        // 点齐落盘的两条提议已由调用方删除；这里处理其余遮罩提议
+        if (other.status !== 'proposed' || other.start === null) continue;
+        const mm = mapRange(other.start, other.end, ops);
+        const intersects = (mm.status === 'mapped' && mm.start < blockEnd && mm.end > blockStart);
+        if (mm.status === 'orphaned' || intersects) {
+          // 选区被本次遮罩块吞掉或压到：该点头作废，需对当前正文重新划
+          other.start = null; other.end = null;
+          other.status = 'void'; other.voidReason = 'mask-overlap';
+          this._event(d, 'mask.voided', other.author, doc.id, { annotation: other.id, reason: 'mask-overlap' });
+        } else {
+          other.start = mm.start; other.end = mm.end; other.version = doc.version + 1;
+        }
+        continue;
+      }
       if (other.start === null) continue;
       const m = mapRange(other.start, other.end, ops);
       if (other.status === 'sealed') {

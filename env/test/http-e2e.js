@@ -10,7 +10,10 @@ const PORT = 8099;
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'review-http-'));
 const dataFile = path.join(tmp, 'data.json');
 const srv = spawn(process.execPath, [path.join(__dirname, '..', 'src', 'server.js')], {
-  env: { ...process.env, PORT: String(PORT), DATA_FILE: dataFile, AUTHOR_PASSWORD: 'apw', REVIEWER_PASSWORD: 'rpw' },
+  env: {
+    ...process.env, PORT: String(PORT), DATA_FILE: dataFile,
+    AUTHOR_PASSWORD: 'apw', REVIEWER_PASSWORD: 'rpw', REVIEWER2_PASSWORD: 'r2pw',
+  },
 });
 
 let passed = 0;
@@ -45,6 +48,12 @@ async function waitReady() {
   throw new Error('server not ready');
 }
 
+// 两位审阅人对同一处选区各点头一次；返回第二次点头的响应（点齐落盘）
+async function nodBoth(docId, start, end, version) {
+  await req('reviewer', 'POST', `/api/docs/${docId}/masks/nod`, { start, end, version });
+  return req('reviewer2', 'POST', `/api/docs/${docId}/masks/nod`, { start, end, version });
+}
+
 (async () => {
   srv.stdout.on('data', d => process.env.DEBUG && process.stdout.write('[srv] ' + d));
   srv.stderr.on('data', d => process.stderr.write('[srv-err] ' + d));
@@ -58,7 +67,9 @@ async function waitReady() {
     ok('错密码 401', (await login('author', 'nope')).status === 401);
     await login('author', 'apw');
     await login('reviewer', 'rpw');
+    await login('reviewer2', 'r2pw');
     ok('登录成功', (await req('author', 'GET', '/api/me')).body.role === 'author');
+    ok('第二名审阅人角色正确', (await req('reviewer2', 'GET', '/api/me')).body.role === 'reviewer');
     const created0 = await req('author', 'POST', '/api/docs', { title: 'tmp', content: 'x' });
     const forbid = await req('author', 'POST', `/api/docs/${created0.body.id}/annotations`,
       { kind: 'comment', start: 0, end: 1, version: 1 });
@@ -73,9 +84,23 @@ async function waitReady() {
 
     const c1 = await req('reviewer', 'POST', `/api/docs/${id}/annotations`,
       { kind: 'comment', start: 0, end: 4, note: '开头更礼貌', version: 1 });
-    const m1 = await req('reviewer', 'POST', `/api/docs/${id}/annotations`,
-      { kind: 'mask', start: x, end: x + 6, version: 1 });
-    ok('批注与遮罩提议创建', c1.status === 201 && m1.status === 201);
+    const m1 = await req('reviewer', 'POST', `/api/docs/${id}/masks/nod`,
+      { start: x, end: x + 6, version: 1 });
+    ok('批注与第一次遮罩点头创建', c1.status === 201 && m1.status === 201 && m1.body.outcome === 'waiting');
+    // 只有一人点头：正文与对外稿都还读得到
+    ok('单人点头不抹字', (await req('reviewer', 'GET', `/api/docs/${id}`)).body.content.includes('X-7788'));
+    // 同一人重复点头不算第二人
+    const m1dup = await req('reviewer', 'POST', `/api/docs/${id}/masks/nod`, { start: x, end: x + 6, version: 1 });
+    ok('同一人重复点头幂等、不点齐', m1dup.body.outcome === 'already-nodded');
+    // 第二人范围对不上：不点齐
+    const m1mis = await req('reviewer2', 'POST', `/api/docs/${id}/masks/nod`, { start: x, end: x + 5, version: 1 });
+    ok('范围对不上不点齐', m1mis.body.outcome === 'waiting' && m1mis.body.applied === false);
+    // 作者无权点头
+    const m1bad = await req('author', 'POST', `/api/docs/${id}/masks/nod`, { start: x, end: x + 6, version: 1 });
+    ok('作者不能点头', m1bad.status === 403);
+    // 旧的单人确认接口已下线
+    const oldConfirm = await req('reviewer', 'POST', `/api/docs/${id}/masks/confirm`, { version: 1 });
+    ok('单人 confirm 接口已下线', oldConfirm.status === 410);
 
     // 打回
     const rej = await req('author', 'POST', `/api/docs/${id}/annotations/${c1.body.id}/resolve`,
@@ -87,8 +112,8 @@ async function waitReady() {
       { content: '尊敬的' + text, version: 1 });
     ok('改原文成功 v2', edit.body.version === 2);
     let anns = (await req('reviewer', 'GET', `/api/docs/${id}/annotations`)).body;
-    const moved = anns.find(a => a.id === m1.body.id);
-    ok('遮罩提议跟随且仍覆盖 X-7788', moved.status === 'proposed' && moved.covered === 'X-7788');
+    const moved = anns.find(a => a.id === m1.body.annotation.id);
+    ok('遮罩点头跟随且仍覆盖 X-7788', moved.status === 'proposed' && moved.covered === 'X-7788');
 
     // 覆盖区删字 -> 失位
     const c2 = await req('reviewer', 'POST', `/api/docs/${id}/annotations`,
@@ -102,15 +127,17 @@ async function waitReady() {
     const orphan = anns.find(a => a.id === c2.body.id);
     ok('覆盖区被删 → orphaned', orphan.status === 'orphaned' && orphan.start === null);
 
-    // 预览
+    // 预览（只有第一个审阅人在 X-7788 上有有效点头；第二人那个错范围的点头覆盖 X-778）
     const prev = await req('reviewer', 'POST', `/api/docs/${id}/masks/preview`, {});
-    ok('预览抹掉 X-7788', !prev.body.preview.includes('X-7788') && prev.body.preview.includes('██████'));
+    ok('预览抹掉待点头选区', prev.body.preview.includes('██████') && !prev.body.preview.includes('X-7788'));
     ok('预览不改原文', (await req('reviewer', 'GET', `/api/docs/${id}`)).body.content.includes('X-7788'));
 
-    // 确认
+    // 第二位审阅人在与第一人完全一致的选区上点头 → 点齐落盘
     const v = (await req('reviewer', 'GET', `/api/docs/${id}`)).body.version;
-    const conf = await req('reviewer', 'POST', `/api/docs/${id}/masks/confirm`, { version: v });
-    ok('确认成功', conf.status === 200);
+    const xCur = Array.from((await req('reviewer', 'GET', `/api/docs/${id}`)).body.content).indexOf('X');
+    const conf = await req('reviewer2', 'POST', `/api/docs/${id}/masks/nod`,
+      { start: xCur, end: xCur + 6, version: v });
+    ok('点齐成功', conf.status === 200 && conf.body.outcome === 'confirmed');
     const after = (await req('reviewer', 'GET', `/api/docs/${id}`)).body;
     ok('正文里已无 X-7788', !after.content.includes('X-7788') && after.content.includes('⟦██████⟧'));
 
@@ -143,10 +170,8 @@ async function waitReady() {
     ok('建母稿 201', mc.status === 201);
     const mid = mc.body.id;
     const tPos = cpIndexOf(mText, 'TOPSECRET9');
-    await req('reviewer', 'POST', `/api/docs/${mid}/annotations`,
-      { kind: 'mask', start: tPos, end: tPos + 10, version: 1 });
-    let vv = (await req('reviewer', 'GET', `/api/docs/${mid}`)).body.version;
-    await req('reviewer', 'POST', `/api/docs/${mid}/masks/confirm`, { version: vv });
+    const conf0 = await nodBoth(mid, tPos, tPos + 10, 1);
+    ok('双人点齐遮罩', conf0.body.outcome === 'confirmed' && conf0.body.applied === true);
     ok('审阅人不能派生', (await req('reviewer', 'POST', `/api/docs/${mid}/derive`, {})).status === 403);
     const der = await req('author', 'POST', `/api/docs/${mid}/derive`, { title: '投放稿A' });
     ok('派生 201', der.status === 201);
@@ -167,10 +192,7 @@ async function waitReady() {
     // 母稿确认新遮罩 → 投放稿跟着遮掉同一段
     const mCur2 = (await req('reviewer', 'GET', `/api/docs/${mid}`)).body;
     const pPos = cpIndexOf(mCur2.content, '三段更新');
-    await req('reviewer', 'POST', `/api/docs/${mid}/annotations`,
-      { kind: 'mask', start: pPos, end: pPos + 4, version: mCur2.version });
-    vv = (await req('reviewer', 'GET', `/api/docs/${mid}`)).body.version;
-    await req('reviewer', 'POST', `/api/docs/${mid}/masks/confirm`, { version: vv });
+    await nodBoth(mid, pPos, pPos + 4, mCur2.version);
     const kCur2 = (await req('reviewer', 'GET', `/api/docs/${kid}`)).body;
     ok('投放稿跟着遮掉同一段', !kCur2.content.includes('三段更新') && kCur2.content.includes('⟦████⟧'));
 
@@ -178,13 +200,10 @@ async function waitReady() {
     const kEmpty = (await req(null, 'GET', `/api/docs/${kid}/external`)).body;
     ok('未放行：投放稿对外稿为空', kEmpty.content === '' && kEmpty.released === 0);
 
-    // 投放稿自己确认遮罩，不写回母稿
+    // 投放稿自己点齐遮罩，不写回母稿
     const kCur3 = (await req('reviewer', 'GET', `/api/docs/${kid}`)).body;
     const sPos = cpIndexOf(kCur3.content, '首段公开');
-    await req('reviewer', 'POST', `/api/docs/${kid}/annotations`,
-      { kind: 'mask', start: sPos, end: sPos + 4, version: kCur3.version });
-    vv = (await req('reviewer', 'GET', `/api/docs/${kid}`)).body.version;
-    await req('reviewer', 'POST', `/api/docs/${kid}/masks/confirm`, { version: vv });
+    await nodBoth(kid, sPos, sPos + 4, kCur3.version);
     ok('投放稿遮罩不写回母稿', (await req('reviewer', 'GET', `/api/docs/${mid}`)).body.content.includes('首段公开'));
 
     // 按段放行：只有作者能放；逐段放行后外面只看到遮完后的字；不可重复放行
@@ -216,10 +235,7 @@ async function waitReady() {
     // 放行后母稿再确认遮罩：已放行段对应那处外面也读不到
     const mNow = (await req('reviewer', 'GET', `/api/docs/${mid}`)).body;
     const tailPos = cpIndexOf(mNow.content, '尾'); // “二段代号TOPSECRET9尾”里 TOPSECRET9 已遮；遮“尾”字
-    await req('reviewer', 'POST', `/api/docs/${mid}/annotations`,
-      { kind: 'mask', start: tailPos, end: tailPos + 1, version: mNow.version });
-    const mNow2 = (await req('reviewer', 'GET', `/api/docs/${mid}`)).body;
-    await req('reviewer', 'POST', `/api/docs/${mid}/masks/confirm`, { version: mNow2.version });
+    await nodBoth(mid, tailPos, tailPos + 1, mNow.version);
     const kExtAfter = (await req(null, 'GET', `/api/docs/${kid}/external`)).body;
     ok('放行后母稿新遮罩追加生效', !kExtAfter.content.includes('尾') && kExtAfter.content.includes('█'));
     ok('另一份仍为空，不被带着亮', (await req(null, 'GET', `/api/docs/${kid2}/external`)).body.content === '');
