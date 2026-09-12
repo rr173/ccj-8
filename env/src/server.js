@@ -196,6 +196,38 @@ app.get('/api/docs/:id/incidents', requireAuth(), async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// ---------- 齐套批次（多份投放稿收成一批对外；成员只进不出） ----------
+// 作者点名至少两份投放稿收进一批。母稿进不了；一份进了这批就不能退出、也不能再进另一批。
+app.post('/api/batches', requireAuth(['author']), async (req, res, next) => {
+  try {
+    const docIds = Array.isArray(req.body && req.body.docIds) ? req.body.docIds : [];
+    const r = await service.createBatch(req.body && req.body.title, docIds, req.user.name);
+    res.status(201).json(r);
+  } catch (e) { next(e); }
+});
+
+app.get('/api/batches', requireAuth(), async (req, res, next) => {
+  try {
+    const list = await service.listBatches();
+    res.json({ count: list.length, batches: list });
+  } catch (e) { next(e); }
+});
+
+app.get('/api/batches/:id', requireAuth(), async (req, res, next) => {
+  try {
+    const b = await service.getBatch(req.params.id);
+    if (!b) return res.status(404).json({ error: '齐套批次不存在' });
+    res.json(b);
+  } catch (e) { next(e); }
+});
+
+// 批次对外稿（免登录）：只有此刻每一份外面都看得见、且字逐字对得上的段才亮。
+// 其余段整段没有；不泄露段数、成员内部正文与未放行原文。
+app.get('/api/batches/:id/external', async (req, res, next) => {
+  try { res.json(await service.batchExternal(req.params.id)); }
+  catch (e) { next(e); }
+});
+
 app.get('/api/docs/:id/events', requireAuth(), async (req, res, next) => {
   try { res.json(await service.events(req.params.id)); }
   catch (e) { next(e); }

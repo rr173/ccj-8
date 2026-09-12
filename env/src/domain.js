@@ -1263,6 +1263,264 @@ class Service {
     });
   }
 
+  // ---------- 齐套批次（多份投放稿收成一批对外；成员只进不出） ----------
+  // 作者把至少两份【投放稿】点名收进同一批：
+  //   - 只有投放稿能进批，母稿进不了；一份进了一批就不能退出、也不能再进另一批；
+  //   - 批次不改任何一份的内部正文，也不存任何段文本——对外视图永远按【此刻各份
+  //     公开口径外面能看见的放行快照】实时求交集，哪份后来放了/遮了，批次这边随之变化；
+  //   - 同一段（按各份当前正文里的段序 currentIndex 对齐）只有每一份都放了、且
+  //     外面的字逐字一致时，这一批才亮这段原文；一份没放 → 整段空；各份字不一致
+  //     （含一份已被事故抽空、另一份还有字）→ 任何一份的原文都不亮，整段空；
+  //   - 缺的那份后来放了、且字与已放的几份对得上，这段这才亮（实时投影，无需重收）。
+  async createBatch(title, docIds, actor) {
+    if (actor !== 'author') throw httpError(403, '只有作者可以收齐套批次');
+    const ids = Array.isArray(docIds) ? docIds : [];
+    if (ids.length < 2) throw httpError(400, '一批至少要收两份投放稿');
+    const uniq = [];
+    for (const x of ids) {
+      if (typeof x !== 'string' || !x) throw httpError(400, '投放稿 id 错误');
+      if (!uniq.includes(x)) uniq.push(x);
+    }
+    if (uniq.length < 2) throw httpError(400, '一批至少要收两份不同的投放稿');
+    return this.store.tx(d => {
+      d.batches = d.batches || {};
+      const members = [];
+      for (const id of uniq) {
+        const doc = d.docs[id];
+        if (!doc) throw httpError(404, `投放稿 ${id} 不存在`);
+        if (!doc.parentId) throw httpError(400, `「${doc.title}」是母稿，母稿进不了齐套批次`);
+        const occupant = this._batchOf(d, id);
+        if (occupant) throw httpError(409, `「${doc.title}」已经在批次「${occupant.title}」里，不能退出也不能再进另一批`);
+        members.push({ id, title: doc.title, addedAt: new Date().toISOString() });
+      }
+      d.counters.batch = (d.counters.batch || 0) + 1;
+      const id = 'bt_' + d.counters.batch;
+      const now = new Date().toISOString();
+      const batch = {
+        id,
+        title: (title && String(title).slice(0, 200)) || `齐套批次 ${d.counters.batch}`,
+        memberIds: uniq,
+        members,
+        createdAt: now, createdBy: actor,
+      };
+      d.batches[id] = batch;
+      this._event(d, 'batch.created', actor, null, {
+        batch: id, title: batch.title, members: uniq, count: uniq.length,
+      });
+      return this._batchDetail(d, batch);
+    });
+  }
+
+  async listBatches() {
+    return this.store.read(d => Object.values(d.batches || {}).map(b => this._batchSummary(d, b)));
+  }
+
+  async getBatch(id) {
+    return this.store.read(d => {
+      const b = (d.batches || {})[id];
+      return b ? this._batchDetail(d, b) : null;
+    });
+  }
+
+  // 批次对外稿（免登录）：只有“此刻每一份外面都看得见、且字逐字对得上”的段才亮。
+  async batchExternal(id) {
+    return this.store.read(d => {
+      const b = (d.batches || {})[id];
+      if (!b) throw httpError(404, '齐套批次不存在');
+      const v = this._batchView(d, b);
+      const parts = v.paragraphs.filter(p => p.visible).map(p => ({ text: p.text }));
+      const content = this._joinParts(parts);
+      const ranges = [];
+      let base = 0;
+      for (const p of parts) {
+        for (const m of p.text.matchAll(/█+/g)) {
+          ranges.push({ start: base + m.index, end: base + m.index + m[0].length, len: m[0].length });
+        }
+        base += p.text.length + 1;
+      }
+      return {
+        id: b.id, title: b.title, content,
+        members: b.memberIds.length,
+        visible: parts.length,
+        complete: v.complete,
+        masks: ranges,
+      };
+    });
+  }
+
+  // 某份当前在哪一批里（成员只进不出、一份至多一批）
+  _batchOf(d, docId) {
+    return Object.values(d.batches || {}).find(b => b.memberIds.includes(docId)) || null;
+  }
+
+  // 各成员【公开口径】此刻外面能看见的放行段：按当前段序 currentIndex 归位。
+  // 段被改动到失去现位置的放行快照进 orphans（摆不进任何段序，永久对不上）。
+  // 返回 { byDoc: Map(docId -> Map(currentIndex -> {release,text})), orphans: [{doc,release}] }
+  _batchMemberParts(d, b) {
+    const byDoc = new Map();
+    const orphans = [];
+    for (const docId of b.memberIds) {
+      const doc = d.docs[docId];
+      const map = new Map();
+      if (doc) {
+        for (const r of this._sortedReleases(doc)) {
+          const text = this._anchorVisible(r.anchor);
+          if (r.currentIndex === null) {
+            orphans.push({ doc: docId, release: r.id });
+            continue;
+          }
+          // 同一当前段序上挂着两条放行（段被合并等极端情形）：记下，之后判为对不上
+          const slot = map.get(r.currentIndex) || [];
+          slot.push({ release: r.id, text });
+          map.set(r.currentIndex, slot);
+        }
+      }
+      byDoc.set(docId, map);
+    }
+    return { byDoc, orphans };
+  }
+
+  // 批次实时投影：只遍历“至少有一份放行到”的段序（没任何一份放的段不存在于对外口径，
+  // 段数/篇幅一律不泄露）。逐段给出状态与各份在场情况：
+  //   visible   每一份在该段序上都放了、外面的字逐字一致且非空行 → 这批亮这段；
+  //   pending   已放的几份字一致（或只有一份放了），剩下的份还没放：缺的份后来逐字
+  //             放齐即可亮（“一份后来才把缺的那段放出去、字对得上，这才亮”）；
+  //   mismatch  已放的份对不上：不同非空原文并存（用词不一样），或一份已被事故抽空成
+  //             空行、另一份还留着原文——任何一份的原文都不亮；
+  //   blank     每一份放了的都已是空行（事故抽空不可复活），这段永远亮不出字。
+  _batchView(d, b) {
+    const { byDoc, orphans } = this._batchMemberParts(d, b);
+    const memberInfo = b.memberIds.map(id => {
+      const doc = d.docs[id];
+      const m = byDoc.get(id);
+      return { id, title: doc ? doc.title : (b.members.find(x => x.id === id) || {}).title || id,
+        released: m ? [...m.values()].reduce((n, list) => n + list.length, 0) : 0,
+        exists: !!doc };
+    });
+
+    const paraCounts = new Map();
+    for (const id of b.memberIds) {
+      const doc = d.docs[id];
+      paraCounts.set(id, doc ? paragraphBounds(doc.content).length : 0);
+    }
+    let maxIndex = -1;
+    for (const m of byDoc.values()) for (const idx of m.keys()) if (idx > maxIndex) maxIndex = idx;
+
+    const paragraphs = [];
+    for (let idx = 0; idx <= maxIndex; idx++) {
+      const perDoc = {};
+      const texts = new Set();      // 已放各份此刻外面的字（含事故抽空后的 ''）
+      let releasedCount = 0;
+      let multi = false;           // 同一份同一当前段序挂着多条放行快照（段被合并等）
+      let missingParagraph = false; // 某份当前正文压根没有这一段（段数已不同）
+      for (const id of b.memberIds) {
+        const list = (byDoc.get(id) || new Map()).get(idx);
+        if (list && list.length > 1) multi = true;
+        const item = list && list.length ? list[0] : null;
+        if (item) {
+          releasedCount++;
+          texts.add(item.text);
+          perDoc[id] = { released: true, text: item.text, release: item.release, blank: item.text === '' };
+        } else if (idx >= (paraCounts.get(id) || 0)) {
+          missingParagraph = true;
+          perDoc[id] = { released: false, missingParagraph: true };
+        } else {
+          perDoc[id] = { released: false };
+        }
+      }
+      const nonEmpty = [...texts].filter(t => t !== '');
+      const allReleased = releasedCount === b.memberIds.length;
+      let status, reason = null;
+      if (allReleased && texts.size === 1 && nonEmpty.length === 1 && !multi) {
+        status = 'visible';
+      } else if (texts.has('') && nonEmpty.length >= 1) {
+        // 一份这边已经空了（事故抽空）、另一份还留着原文：原文不能亮；缺的份再放
+        // 同一段也只会和空行对不上，靠“补放”齐不了。
+        status = 'mismatch'; reason = 'blank-vs-text';
+      } else if (nonEmpty.length > 1) {
+        // 各份用词已经不一样：任何一份的原文都不亮（后来新增遮罩把差异处遮成一致
+        // 的 █ 时可以重新对得上——状态是实时算的，不把此刻的对不上记成死账）。
+        status = 'mismatch'; reason = 'divergent';
+      } else if (multi) {
+        status = 'mismatch'; reason = 'multi';
+      } else if (missingParagraph) {
+        // 某份当前正文没有这一段：它没有“缺的那段”可补放。
+        status = 'mismatch'; reason = 'missing-paragraph';
+      } else if (allReleased && texts.has('') && nonEmpty.length === 0) {
+        // 每一份放了的都已是空行：字对得上（都为空），但外面看不见任何字。
+        status = 'blank'; reason = 'blank';
+      } else {
+        // 已放的几份字一致（或都空、或只有一份放了非空字），其余份还没放
+        status = 'pending';
+      }
+      paragraphs.push({
+        index: idx, status,
+        visible: status === 'visible',
+        reason,
+        text: status === 'visible' ? nonEmpty[0] : '',
+        released: releasedCount,
+        members: perDoc,
+      });
+    }
+
+    const visibleCount = paragraphs.filter(p => p.visible).length;
+    const pending = paragraphs.filter(p => p.status === 'pending').map(p => p.index);
+    const mismatch = paragraphs.filter(p => p.status === 'mismatch')
+      .map(p => ({ index: p.index, reason: p.reason }));
+    const blank = paragraphs.filter(p => p.status === 'blank').map(p => p.index);
+    // “哪一份还没放到齐”：逐份列出它还没放行的段（任何一个槽位上没放就算没放齐）
+    const pendingByMember = {};
+    for (const id of b.memberIds) {
+      const missing = paragraphs.filter(p => !p.members[id].released).map(p => p.index);
+      if (missing.length) pendingByMember[id] = missing;
+    }
+    // 齐套：每个槽位都亮、没有摆不进段序的快照、成员文档都还在
+    const complete = paragraphs.length > 0
+      && pending.length === 0 && mismatch.length === 0 && blank.length === 0
+      && orphans.length === 0 && memberInfo.every(m => m.exists);
+    return {
+      id: b.id, title: b.title, createdAt: b.createdAt, createdBy: b.createdBy,
+      members: memberInfo,
+      paragraphs,
+      visibleCount,
+      pending,
+      mismatch,
+      blank,
+      pendingByMember,
+      orphans,
+      complete,
+    };
+  }
+
+  _batchSummary(d, b) {
+    const v = this._batchView(d, b);
+    return {
+      id: b.id, title: b.title, createdAt: b.createdAt,
+      memberCount: b.memberIds.length,
+      members: v.members.map(m => ({ id: m.id, title: m.title, released: m.released })),
+      visible: v.visibleCount,
+      pending: v.pending,
+      mismatch: v.mismatch,
+      blank: v.blank,
+      pendingByMember: v.pendingByMember,
+      orphans: v.orphans.length,
+      complete: v.complete,
+    };
+  }
+
+  // 登录可读的批次明细：每一段各份放没放、字对不对、谁还缺、为什么亮不出
+  _batchDetail(d, b) {
+    const v = this._batchView(d, b);
+    return {
+      ...this._batchSummary(d, b),
+      createdBy: v.createdBy,
+      memberIds: b.memberIds,
+      paragraphCount: v.paragraphs.length,
+      paragraphDetails: v.paragraphs,
+      orphanDetails: v.orphans,
+    };
+  }
+
   // ---------- 批注查询 ----------
   async annotations(docId) {
     return this.store.read(d => Object.values(d._ann || {})
@@ -1772,6 +2030,7 @@ class Service {
   _docView(d, doc) {
     const parent = doc.parentId ? d.docs[doc.parentId] : null;
     const cbList = (d.callbacks && d.callbacks[doc.id]) || [];
+    const batch = doc.parentId ? this._batchOf(d, doc.id) : null;
     return {
       id: doc.id, title: doc.title, content: doc.content,
       version: doc.version, status: doc.status,
@@ -1779,6 +2038,7 @@ class Service {
       masks: extractMasks(doc.content),
       parentId: doc.parentId || null,
       baseVersion: doc.baseVersion || null,
+      batch: batch ? { id: batch.id, title: batch.title } : null,
       paragraphs: paragraphBounds(doc.content).map(([start, end]) => ({ start, end })),
       releases: (doc.releases || []).map(r => this._releaseView(r)),
       recalls: (doc.recalls || []).map(o => this._recallView(o)),

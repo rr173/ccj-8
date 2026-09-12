@@ -960,6 +960,202 @@ async function main() {
   ok('文档视图带事故单列表', (await svc.getDoc(inDoc.id)).incidents.length === 1
     && (await svc.listDocs()).find(x => x.id === inDoc.id).incidents === 1);
 
+  console.log('32) 齐套批次：投放稿点名进批、只进不出；对外只见各份此刻都放且字对得上的段');
+  // (a) 收成一批：至少两份；母稿进不了；重复/已在批的点名都拒绝
+  const btText = '齐套首段甲。\n齐套二段乙。\n齐套三段丙。';
+  const btMaster = await svc.createDoc('齐套母稿', btText, 'author');
+  const btA = await svc.deriveDoc(btMaster.id, '齐套投放稿A', 'author');
+  const btB = await svc.deriveDoc(btMaster.id, '齐套投放稿B', 'author');
+  const btC = await svc.deriveDoc(btMaster.id, '齐套投放稿C', 'author');
+  const errReviewerBatch = await svc.createBatch('批', [btA.id, btB.id], 'reviewer').then(() => null, e => e);
+  ok('审阅人不能收齐套批次', errReviewerBatch && errReviewerBatch.status === 403);
+  const errBtMaster = await svc.createBatch('批', [btMaster.id, btA.id], 'author').then(() => null, e => e);
+  ok('母稿进不了齐套批次', errBtMaster && errBtMaster.status === 400);
+  const errSingle = await svc.createBatch('批', [btA.id], 'author').then(() => null, e => e);
+  ok('一批少于两份被拒', errSingle && errSingle.status === 400);
+  const errBtDup = await svc.createBatch('批', [btA.id, btA.id], 'author').then(() => null, e => e);
+  ok('同一份重复点名不算两份', errBtDup && errBtDup.status === 400);
+  const errMissing = await svc.createBatch('批', [btA.id, 'doc_9999'], 'author').then(() => null, e => e);
+  ok('不存在的投放稿点名被拒', errMissing && errMissing.status === 404);
+
+  const bt = await svc.createBatch('六月齐套', [btA.id, btB.id], 'author');
+  ok('批次创建成功（两份投放稿）', bt.id.startsWith('bt_') && bt.memberCount === 2 && bt.complete === false);
+  ok('明细逐份列出成员', bt.members.length === 2
+    && bt.members.some(m => m.id === btA.id) && bt.members.some(m => m.id === btB.id));
+  ok('文档视图带所在批次', (await svc.getDoc(btA.id)).batch.id === bt.id
+    && (await svc.getDoc(btMaster.id)).batch === null);
+  const errBtAgain = await svc.createBatch('另一批', [btA.id, btC.id], 'author').then(() => null, e => e);
+  ok('进了这批不能再进另一批', errBtAgain && errBtAgain.status === 409);
+  const errTwoBatches = await svc.createBatch('再一批', [btB.id, btA.id], 'author').then(() => null, e => e);
+  ok('成员已在批的任何收批都拒绝', errTwoBatches && errTwoBatches.status === 409);
+  ok('批次列表可查', (await svc.listBatches()).some(x => x.id === bt.id && x.title === '六月齐套'));
+
+  // (b) 一份没放：这批外面整份为空，不泄露段数篇幅；缺的份报得出来
+  let btExt = await svc.batchExternal(bt.id);
+  ok('一份都没放：批次对外为空、0 段可见、未齐套', btExt.content === '' && btExt.visible === 0 && btExt.complete === false);
+  ok('批次对外响应不含未放行原文', JSON.stringify(btExt).indexOf('齐套首段甲') < 0);
+
+  // (c) 只 A 放第一段：一份放了另一份没放，这段外面是空的
+  await svc.releaseParagraph(btA.id, 0, 'author', (await svc.getDoc(btA.id)).version);
+  let btView = await svc.getBatch(bt.id);
+  ok('一份放了另一份没放：槽位 pending（不亮）',
+    btView.paragraphDetails[0].status === 'pending' && btView.paragraphDetails[0].visible === false
+    && btView.paragraphDetails[0].members[btB.id].released === false);
+  ok('能查出 B 还缺第一段', JSON.stringify(btView.pendingByMember[btB.id]) === JSON.stringify([0]));
+  btExt = await svc.batchExternal(bt.id);
+  ok('只有一份放：批次外面这段仍空', btExt.content === '');
+
+  // (d) B 后来把缺的第一段放出、字对得上：这才亮
+  await svc.releaseParagraph(btB.id, 0, 'author', (await svc.getDoc(btB.id)).version);
+  btView = await svc.getBatch(bt.id);
+  ok('两份都放且字一致：槽位 visible', btView.paragraphDetails[0].status === 'visible'
+    && btView.paragraphDetails[0].text === '齐套首段甲。');
+  btExt = await svc.batchExternal(bt.id);
+  ok('批次外面此刻亮第一段', btExt.content === '齐套首段甲。' && btExt.visible === 1);
+
+  // (e) A、B 都放第二段但词不一样（等长、单字不同）：任何一份的原文都不亮
+  {
+    const aDoc = await svc.getDoc(btA.id);
+    await svc.editContent(btA.id, aDoc.content.replace('齐套二段乙。', '齐套二段X。'), 'author', aDoc.version);
+    await svc.releaseParagraph(btA.id, 1, 'author', (await svc.getDoc(btA.id)).version);
+    await svc.releaseParagraph(btB.id, 1, 'author', (await svc.getDoc(btB.id)).version);
+    btView = await svc.getBatch(bt.id);
+    ok('各份用词不一样：mismatch(divergent)，两份原文都不亮',
+      btView.paragraphDetails[1].status === 'mismatch'
+      && btView.paragraphDetails[1].reason === 'divergent'
+      && btView.paragraphDetails[1].text === '');
+    btExt = await svc.batchExternal(bt.id);
+    ok('对外不亮任何一份的第二段原文', btExt.content === '齐套首段甲。'
+      && !btExt.content.includes('二段X') && !btExt.content.includes('二段乙'));
+    // 缺的第三段两份都没放：不在槽位里（不泄露段数），pendingByMember 不凭空报
+    ok('一份都没放的段不出现在明细里', !btView.paragraphDetails.some(p => p.index === 2));
+  }
+
+  // (f) 差异只靠“外面可见字变少”收敛：各份分别把不同的那个字遮掉，█ 等长一致后才亮
+  {
+    const aDoc = await svc.getDoc(btA.id);
+    const bDoc = await svc.getDoc(btB.id);
+    const aPos = cpIndexOf(aDoc.content, 'X');
+    await nodBoth(btA.id, aPos, aPos + 1, aDoc.version);
+    const bDoc2 = await svc.getDoc(btB.id);
+    const bPos = cpIndexOf(bDoc2.content, '乙');
+    await nodBoth(btB.id, bPos, bPos + 1, bDoc2.version);
+    btView = await svc.getBatch(bt.id);
+    ok('差异处各被遮罩抹成一致的 █：槽位重新 visible',
+      btView.paragraphDetails[1].status === 'visible'
+      && btView.paragraphDetails[1].text === '齐套二段█。');
+    btExt = await svc.batchExternal(bt.id);
+    ok('对外亮遮后一致字、masks 可查', btExt.content === '齐套首段甲。\n齐套二段█。'
+      && btExt.masks.some(m => m.len === 1));
+    // 已抹掉的字在批次投影里救不回来
+    ok('批次响应里没有任何一份被遮的字', !JSON.stringify(btExt).includes('二段X')
+      && !JSON.stringify(btExt).includes('二段乙'));
+  }
+
+  // (g) 齐套不改正文、不跨份同步遮罩：A 上的遮罩不写回母稿、不写到 B；两份措辞互不覆盖
+  ok('A 的遮罩不写回母稿（母稿仍有“乙”）', (await svc.getDoc(btMaster.id)).content.includes('齐套二段乙'));
+  ok('两份内部正文互不覆盖（B 从没出现 A 的 X 字）', !(await svc.getDoc(btB.id)).content.includes('X'));
+
+  // (h) 第三段只 B 放：pending；A 再放且字对得上后齐套
+  await svc.releaseParagraph(btB.id, 2, 'author', (await svc.getDoc(btB.id)).version);
+  btView = await svc.getBatch(bt.id);
+  ok('只 B 放第三段：pending 且 A 缺', btView.paragraphDetails[2].status === 'pending'
+    && JSON.stringify(btView.pendingByMember[btA.id]) === JSON.stringify([2]));
+  await svc.releaseParagraph(btA.id, 2, 'author', (await svc.getDoc(btA.id)).version);
+  btView = await svc.getBatch(bt.id);
+  btExt = await svc.batchExternal(bt.id);
+  ok('三段全部对得上：批次齐套、可见 3 段', btView.complete === true && btView.visible === 3
+    && btExt.complete === true && btExt.visible === 3
+    && btExt.content === '齐套首段甲。\n齐套二段█。\n齐套三段丙。');
+  ok('齐套后没有 pending/mismatch/blank', btView.pending.length === 0
+    && btView.mismatch.length === 0 && btView.blank.length === 0 && btView.orphans === 0);
+
+  // (i) 一份这边已经空了（事故抽空）、另一份还留着原文：不能亮原文
+  {
+    const vkText = '抽空首段甲。\n抽空二段乙。';
+    const vkMaster = await svc.createDoc('抽空母稿', vkText, 'author');
+    const vkA = await svc.deriveDoc(vkMaster.id, '抽空稿A', 'author');
+    const vkB = await svc.deriveDoc(vkMaster.id, '抽空稿B', 'author');
+    for (const p of [0, 1]) {
+      await svc.releaseParagraph(vkA.id, p, 'author', (await svc.getDoc(vkA.id)).version);
+      await svc.releaseParagraph(vkB.id, p, 'author', (await svc.getDoc(vkB.id)).version);
+    }
+    // A 渠道召回第二段后，把该段原文全量送回 → gap 型泄露 + 拒不召回
+    await svc.recallParagraphs(vkA.id, '渠道X', [1], 'author', (await svc.getDoc(vkA.id)).version);
+    const vkCb = await svc.registerCallback(vkA.id, '渠道X', vkText, 'author');
+    const vkRec = (await svc.callbacks(vkA.id, '渠道X')).callbacks[0];
+    const gapIdx = vkRec.leak.items.findIndex(it => it.locator && it.locator.kind === 'gap');
+    ok('缝里泄露可定位', gapIdx >= 0);
+    await svc.openIncident(vkA.id, vkRec.id, gapIdx, vkCb.leakFragments[gapIdx],
+      'author', (await svc.getDoc(vkA.id)).version);
+    const vkBatch = await svc.createBatch('抽空齐套', [vkA.id, vkB.id], 'author');
+    const vkView = await svc.getBatch(vkBatch.id);
+    const slot1 = vkView.paragraphDetails.find(p => p.index === 1);
+    ok('一份已空、另一份留原文：mismatch(blank-vs-text)，原文不亮',
+      slot1.status === 'mismatch' && slot1.reason === 'blank-vs-text'
+      && slot1.members[vkA.id].blank === true && slot1.members[vkB.id].text === '抽空二段乙。');
+    const vkExt = await svc.batchExternal(vkBatch.id);
+    ok('批次外面只亮对得上的第一段，第二段整段空', vkExt.content === '抽空首段甲。'
+      && !vkExt.content.includes('抽空二段乙'));
+    // 内部正文没被事故/批次改动
+    ok('抽空不改正文（A、B 内部都还有第二段）',
+      (await svc.getDoc(vkA.id)).content.includes('抽空二段乙')
+      && (await svc.getDoc(vkB.id)).content.includes('抽空二段乙'));
+  }
+
+  // (j) 某份内部删掉一段后该份缺这一段：即使另一份放了，这段也靠补放齐不了
+  {
+    const mpText = '删段首段甲。\n删段二段乙。';
+    const mpMaster = await svc.createDoc('删段母稿', mpText, 'author');
+    const mpA = await svc.deriveDoc(mpMaster.id, '删段稿A', 'author');
+    const mpB = await svc.deriveDoc(mpMaster.id, '删段稿B', 'author');
+    await svc.releaseParagraph(mpA.id, 0, 'author', (await svc.getDoc(mpA.id)).version);
+    await svc.releaseParagraph(mpB.id, 0, 'author', (await svc.getDoc(mpB.id)).version);
+    // B 内部删掉第二段（未放行段，删了没有快照可摆进这段段序）
+    const bDoc = await svc.getDoc(mpB.id);
+    await svc.editContent(mpB.id, '删段首段甲。', 'author', bDoc.version);
+    await svc.releaseParagraph(mpA.id, 1, 'author', (await svc.getDoc(mpA.id)).version);
+    const mpBatch = await svc.createBatch('删段齐套', [mpA.id, mpB.id], 'author');
+    const mpView = await svc.getBatch(mpBatch.id);
+    const slot1 = mpView.paragraphDetails.find(p => p.index === 1);
+    ok('一份根本没有这一段：mismatch(missing-paragraph)',
+      slot1.status === 'mismatch' && slot1.reason === 'missing-paragraph'
+      && slot1.members[mpB.id].missingParagraph === true);
+    const mpExt = await svc.batchExternal(mpBatch.id);
+    ok('批次外面只有对得上的第一段', mpExt.content === '删段首段甲。'
+      && !mpExt.content.includes('删段二段乙'));
+  }
+
+  // (k) 已放行段被内部改文冲到失去现位置：快照摆不进段序，报 orphan，永远对不上
+  {
+    const opText = '失位首段甲。\n失位二段乙。';
+    const opMaster = await svc.createDoc('失位母稿', opText, 'author');
+    const opA = await svc.deriveDoc(opMaster.id, '失位稿A', 'author');
+    const opB = await svc.deriveDoc(opMaster.id, '失位稿B', 'author');
+    await svc.releaseParagraph(opA.id, 1, 'author', (await svc.getDoc(opA.id)).version);
+    // A 内部把第二段改掉，使该放行快照失去现位置
+    const aDoc = await svc.getDoc(opA.id);
+    await svc.editContent(opA.id, '失位首段甲。\n完全改写后的第二段。', 'author', aDoc.version);
+    await svc.releaseParagraph(opB.id, 0, 'author', (await svc.getDoc(opB.id)).version);
+    const opBatch = await svc.createBatch('失位齐套', [opA.id, opB.id], 'author');
+    const opView = await svc.getBatch(opBatch.id);
+    ok('失位快照进 orphanDetails、批次不算齐', opView.orphanDetails.some(o => o.doc === opA.id)
+      && opView.complete === false);
+  }
+
+  // (l) 批次事件可查；批次数据不复制段文本（只存成员 id）
+  {
+    const rawBt = JSON.parse(fs.readFileSync(path.join(tmp, 'data.json'), 'utf8'));
+    const stored = rawBt.batches[bt.id];
+    ok('批次落盘只有成员 id/标题，不复制任何段文本',
+      stored.memberIds.length === 2 && !JSON.stringify(stored).includes('齐套首段甲')
+      && !JSON.stringify(stored).includes('齐套三段丙'));
+    const btEvents = await svc.events(null);
+    const hasBtEvent = btEvents.some(e => e.type === 'batch.created' && e.detail.batch === bt.id
+      && e.detail.count === 2 && !JSON.stringify(e.detail).includes('齐套首段甲'));
+    ok('批次创建事件只记 id/成员，不含正文', hasBtEvent);
+  }
+
   console.log(`\n全部通过：${passed} 项断言`);
 }
 main().catch(e => { console.error('测试失败:', e); process.exit(1); });

@@ -7,6 +7,7 @@ const $$ = s => [...document.querySelectorAll(s)];
 const state = {
   me: null,
   docs: [],
+  batches: [],
   doc: null,
   annotations: [],
   events: [],
@@ -61,6 +62,8 @@ async function boot() {
     state.me = await api('GET', '/api/me');
     await showList();
   } catch {
+    const bm = location.hash.match(/^#\/batch\/([^?]+)$/);
+    if (bm) return showBatchExternal(decodeURIComponent(bm[1]));
     const m = location.hash.match(/^#\/ext\/([^?]+)(?:\?channel=(.*))?$/);
     if (m) return showExternal(decodeURIComponent(m[1]), m[2] ? decodeURIComponent(m[2]) : null);
     if (location.hash.startsWith('#/ext/')) return showExternal(location.hash.slice(6));
@@ -90,7 +93,9 @@ async function showList() {
   show('listView');
   $('#whoami').textContent = `${state.me.username}（${state.me.role === 'author' ? '作者' : '审阅人'}）`;
   $('#newDoc').classList.toggle('hidden', state.me.role !== 'author');
+  $('#batchCreate').classList.toggle('hidden', state.me.role !== 'author');
   await loadDocs();
+  await loadBatches();
 }
 async function loadDocs() {
   state.docs = await api('GET', '/api/docs');
@@ -131,6 +136,114 @@ $('#createBtn').onclick = async () => {
     await openDoc(doc.id);
   } catch (e) { $('#listErr').textContent = e.message; }
 };
+
+// ---------- 齐套批次 ----------
+async function loadBatches() {
+  let list = { batches: [] };
+  try { list = await api('GET', '/api/batches'); } catch { return; }
+  state.batches = list.batches || [];
+  const tb = $('#batchTable tbody');
+  if (!state.batches.length) {
+    tb.innerHTML = '<tr><td colspan="5" class="hint">还没有齐套批次。</td></tr>';
+  } else {
+    tb.innerHTML = state.batches.map(b => `
+      <tr>
+        <td>${esc(b.title)}</td>
+        <td>${b.memberCount} 份（${b.members.map(m => esc(m.title)).join('、')}）</td>
+        <td>${b.visible} 段</td>
+        <td>${b.complete
+          ? '<span class="tag closed">已齐套</span>'
+          : `<span class="tag open">未齐</span>${b.mismatch.length ? ' <span class="tag" title="有段各份对不上，亮不出来">对不上×' + b.mismatch.length + '</span>' : ''}`}</td>
+        <td><button data-id="${b.id}" class="link batch-detail">明细</button>
+            <a href="#/batch/${b.id}" class="open-ext">对外稿</a></td>
+      </tr>`).join('');
+    tb.querySelectorAll('.batch-detail').forEach(el => el.onclick = () => openBatchModal(el.dataset.id));
+  }
+  // 作者收批：勾选未进批的投放稿（至少两份）
+  const box = $('#batchCreate');
+  if (box && !box.classList.contains('hidden')) {
+    const inBatch = new Set(state.batches.flatMap(b => b.members.map(m => m.id)));
+    const free = state.docs.filter(d => d.parentId && !inBatch.has(d.id));
+    box.innerHTML = `<h3>收一批齐套</h3>
+      <input id="newBatchTitleInput" maxlength="200" placeholder="批次标题（留空自动命名）" style="margin-bottom:6px">
+      <div class="batch-pick">${free.length
+        ? free.map(d => `<label><input type="checkbox" value="${d.id}"> ${esc(d.title)}（已放行 ${d.released || 0} 段）</label>`).join('')
+        : '<span class="hint">没有可进批的投放稿（投放稿一旦进批就不能退出或再进另一批）。</span>'}</div>
+      <button id="createBatchBtn" class="primary" ${free.length < 2 ? 'disabled' : ''}>收成一批（至少两份）</button>
+      <span id="batchErr" class="error"></span>`;
+    $('#createBatchBtn').onclick = async () => {
+      const ids = [...box.querySelectorAll('input:checked')].map(c => c.value);
+      $('#batchErr').textContent = '';
+      try {
+        await api('POST', '/api/batches', {
+          title: $('#newBatchTitleInput').value.trim() || undefined,
+          docIds: ids,
+        });
+        toast('齐套批次已创建');
+        await loadBatches();
+      } catch (e) { $('#batchErr').textContent = e.message; }
+    };
+  }
+}
+
+const BATCH_REASON = {
+  divergent: '各份已放的字不一样',
+  'blank-vs-text': '一份已抽空、另一份还留着原文',
+  'missing-paragraph': '某一份内部已没有这一段',
+  multi: '同一份这一段序上挂着多条放行',
+};
+
+async function openBatchModal(id) {
+  const b = await api('GET', '/api/batches/' + id);
+  $('#batchModalTitle').textContent = b.title + (b.complete ? '（已齐套）' : '（未齐）');
+  $('#batchModalMeta').textContent =
+    `成员 ${b.memberCount} 份：${b.members.map(m => m.title + '（放 ' + m.released + ' 段）').join('、')} · 对外可见 ${b.visible} 段`
+    + (b.orphans ? ` · ${b.orphans} 条放行快照失去段序` : '');
+  const name = id => (b.members.find(m => m.id === id) || { title: id }).title;
+  const rows = b.paragraphDetails.map(p => {
+    const cells = b.memberIds.map(mid => {
+      const st = p.members[mid] || {};
+      if (st.missingParagraph) return '<span class="tag">无此段</span>';
+      if (!st.released) return '<span class="muted">未放</span>';
+      if (st.blank) return '<span class="tag">已抽空（空行）</span>';
+      return `<span class="tag closed" title="${esc(st.text)}">已放</span>`;
+    }).join('</td><td>');
+    let badge;
+    if (p.status === 'visible') badge = '<span class="tag closed">亮</span>';
+    else if (p.status === 'pending') badge = '<span class="tag open">缺：' + b.memberIds.filter(mid => !p.members[mid].released).map(name).join('、') + '</span>';
+    else if (p.status === 'blank') badge = '<span class="tag">各份都已是空行</span>';
+    else badge = `<span class="tag">${esc(BATCH_REASON[p.reason] || p.reason)}</span>`;
+    return `<tr><td>第 ${p.index + 1} 段</td><td>${cells}</td><td>${badge}</td></tr>`;
+  }).join('');
+  $('#batchModalBody').innerHTML = rows
+    ? `<table class="batch-detail-table"><thead><tr><th>段</th>${b.memberIds.map(m => `<th>${esc(name(m))}</th>`).join('')}<th>这批</th></tr></thead><tbody>${rows}</tbody></table>`
+    : '<p class="hint">还没有任何一份放行段落；哪一份都还没放到齐。</p>';
+  $('#batchExtLink').href = '#/batch/' + b.id;
+  $('#batchModal').classList.remove('hidden');
+}
+$('#batchModalCancel').onclick = () => $('#batchModal').classList.add('hidden');
+$('#batchModal').addEventListener('click', e => { if (e.target.id === 'batchModal') $('#batchModal').classList.add('hidden'); });
+
+// ---------- 对外稿 ----------
+async function showBatchExternal(id) {
+  show('externalView');
+  try {
+    const d = await api('GET', '/api/batches/' + encodeURIComponent(id) + '/external');
+    $('#extTitle').textContent = d.title;
+    $('#extStatus').textContent = d.complete ? '已齐套' : '未齐套（内容可能继续变化）';
+    $('#extStatus').className = 'tag ' + (d.complete ? 'closed' : 'open');
+    $('#extChannel').textContent = `齐套批次对外口径 · ${d.members} 份投放稿`;
+    $('#extContent').innerHTML = renderExternalHtml(d.content);
+    if (!d.content) {
+      $('#extHint').textContent = '（这批此刻没有任何一份各份都放了、且字对得上的段：外面看不到任何内容。）';
+      return;
+    }
+    $('#extHint').textContent = `共 ${d.visible} 段对外可见`
+      + (d.masks.length ? `；${d.masks.reduce((a, m) => a + m.len, 0)} 字被遮罩，任何人无法读取。` : '。');
+  } catch (e) {
+    $('#extContent').textContent = '加载失败：' + e.message;
+  }
+}
 
 // ---------- 对外稿 ----------
 async function showExternal(id, channel) {
@@ -1007,6 +1120,8 @@ function renderEvents() {
 
 // ---------- 路由 ----------
 window.addEventListener('hashchange', () => {
+  const bm = location.hash.match(/^#\/batch\/([^?]+)$/);
+  if (bm) return showBatchExternal(decodeURIComponent(bm[1]));
   const m = location.hash.match(/^#\/ext\/([^?]+)(?:\?channel=(.*))?$/);
   if (m) return showExternal(decodeURIComponent(m[1]), m[2] ? decodeURIComponent(m[2]) : null);
   if (location.hash.startsWith('#/ext/')) showExternal(location.hash.slice(6));

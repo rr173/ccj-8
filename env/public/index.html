@@ -56,6 +56,21 @@
       </div>
       <p class="error" id="listErr"></p>
     </div>
+
+    <div class="card">
+      <h3>齐套批次（多份投放稿收成一批对外）</h3>
+      <p class="hint">点名<b>至少两份投放稿</b>收进一批：母稿进不了；一份进了这批就不能退出、也不能再进另一批。
+        对外看这批，只能看到<b>此刻每一份外面都还看得见、且字逐字对得上</b>的段——一份没放、各份用词不一样、或一份已抽空另一份还有原文，这段都整段空着；
+        缺的份后来逐字放齐后这段才亮。批次不改正文、不复活已抹掉的字。</p>
+      <div id="batchCreate" class="hidden">
+        <input id="newBatchTitle" maxlength="200" placeholder="批次标题（留空自动命名）">
+      </div>
+      <table id="batchTable">
+        <thead><tr><th>批次</th><th>成员</th><th>对外可见段</th><th>齐套</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <p class="hint" id="batchHint"></p>
+    </div>
   </section>
 
   <!-- 审阅工作区 -->
@@ -191,6 +206,19 @@
       <div class="row right">
         <button id="incidentModalCancel">取消</button>
         <button id="incidentModalOk" class="primary danger">开单（不可改、不可撤）</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 齐套批次明细弹层 -->
+  <div id="batchModal" class="modal hidden">
+    <div class="modal-box card wide">
+      <h3 id="batchModalTitle"></h3>
+      <p class="hint" id="batchModalMeta"></p>
+      <div id="batchModalBody"></div>
+      <div class="row right">
+        <a id="batchExtLink" class="open-ext" href="#" target="_blank" rel="noopener">批次对外稿</a>
+        <button id="batchModalCancel" class="primary">关闭</button>
       </div>
     </div>
   </div>

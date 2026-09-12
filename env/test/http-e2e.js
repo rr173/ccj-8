@@ -513,6 +513,75 @@ async function nodBoth(docId, start, end, version) {
     ok('没有撤销事故单的接口', (await req('author', 'DELETE',
       `/api/docs/${inKid}/incidents/${opened.body.incident.id}`)).status === 404);
 
+    console.log('I) 齐套批次');
+    // 母稿 + 三份投放稿
+    const btMc = await req('author', 'POST', '/api/docs', { title: '齐套母稿',
+      content: '批次首段甲。\n批次二段乙。\n批次三段丙。' });
+    const btA = (await req('author', 'POST', `/api/docs/${btMc.body.id}/derive`, { title: '齐套A' })).body.id;
+    const btB = (await req('author', 'POST', `/api/docs/${btMc.body.id}/derive`, { title: '齐套B' })).body.id;
+    const btC = (await req('author', 'POST', `/api/docs/${btMc.body.id}/derive`, { title: '齐套C' })).body.id;
+
+    // 门槛：审阅人无权 / 母稿进不了 / 少于两份 / 成员已在批
+    ok('审阅人不能收齐套批次', (await req('reviewer', 'POST', '/api/batches', { docIds: [btA, btB] })).status === 403);
+    ok('母稿进不了批次', (await req('author', 'POST', '/api/batches', { docIds: [btMc.body.id, btA] })).status === 400);
+    ok('少于两份被拒', (await req('author', 'POST', '/api/batches', { docIds: [btA] })).status === 400);
+    const btCreated = await req('author', 'POST', '/api/batches', { title: '六月批次', docIds: [btA, btB] });
+    ok('收批 201、成员两份、未齐套', btCreated.status === 201
+      && btCreated.body.memberCount === 2 && btCreated.body.complete === false);
+    const btId = btCreated.body.id;
+    ok('一份不能再进另一批', (await req('author', 'POST', '/api/batches', { docIds: [btA, btC] })).status === 409);
+    ok('文档视图带批次', (await req('author', 'GET', `/api/docs/${btA}`)).body.batch.id === btId);
+    ok('批次列表可查', (await req('reviewer', 'GET', '/api/batches')).body.batches.some(x => x.id === btId));
+    ok('批次详情登录可读', (await req('reviewer', 'GET', `/api/batches/${btId}`)).body.paragraphCount === 0);
+    ok('批次不存在 404', (await req('author', 'GET', '/api/batches/bt_9999')).status === 404);
+
+    // 免登录对外：还没放齐 → 空
+    let btPub = await req(null, 'GET', `/api/batches/${btId}/external`);
+    ok('批次对外免登录、未放齐为空', btPub.status === 200 && btPub.body.content === '' && btPub.body.complete === false);
+    ok('对外不泄露未放原文/成员正文', JSON.stringify(btPub.body).indexOf('批次首段甲') < 0);
+
+    // 一份放、另一份没放 → 空；两份都放且字一致 → 亮
+    await req('author', 'POST', `/api/docs/${btA}/release`, { paragraph: 0 });
+    btPub = await req(null, 'GET', `/api/batches/${btId}/external`);
+    ok('只一份放：批次外面仍空', btPub.body.content === '' && btPub.body.visible === 0);
+    let btDetail = (await req('author', 'GET', `/api/batches/${btId}`)).body;
+    ok('查得出 B 还没放到齐（第一段）', JSON.stringify(btDetail.pendingByMember[btB]) === '[0]');
+    await req('author', 'POST', `/api/docs/${btB}/release`, { paragraph: 0 });
+    btPub = await req(null, 'GET', `/api/batches/${btId}/external`);
+    ok('两份字对得上：批次外面亮这段', btPub.body.content === '批次首段甲。' && btPub.body.visible === 1);
+
+    // 第二段各放各的、用词不一样 → 两份原文都不亮
+    let aDoc = (await req('author', 'GET', `/api/docs/${btA}`)).body;
+    await req('author', 'PUT', `/api/docs/${btA}/content`,
+      { content: aDoc.content.replace('批次二段乙。', '批次二段X。'), version: aDoc.version });
+    await req('author', 'POST', `/api/docs/${btA}/release`, { paragraph: 1 });
+    await req('author', 'POST', `/api/docs/${btB}/release`, { paragraph: 1 });
+    btDetail = (await req('author', 'GET', `/api/batches/${btId}`)).body;
+    const slot1 = btDetail.paragraphDetails.find(p => p.index === 1);
+    ok('用词不一样：mismatch(divergent)', slot1.status === 'mismatch' && slot1.reason === 'divergent');
+    btPub = await req(null, 'GET', `/api/batches/${btId}/external`);
+    ok('不一致段两份原文都不亮', btPub.body.content === '批次首段甲。'
+      && !btPub.body.content.includes('二段X') && !btPub.body.content.includes('二段乙'));
+
+    // 各份把不同的字分别遮掉 → █ 一致后才亮；第三段补放齐 → 齐套
+    aDoc = (await req('author', 'GET', `/api/docs/${btA}`)).body;
+    const ax = Array.from(aDoc.content).indexOf('X');
+    await req('reviewer', 'POST', `/api/docs/${btA}/masks/nod`, { start: ax, end: ax + 1, version: aDoc.version });
+    await req('reviewer2', 'POST', `/api/docs/${btA}/masks/nod`, { start: ax, end: ax + 1, version: aDoc.version });
+    let bDoc = (await req('author', 'GET', `/api/docs/${btB}`)).body;
+    const by = Array.from(bDoc.content).indexOf('乙');
+    await req('reviewer', 'POST', `/api/docs/${btB}/masks/nod`, { start: by, end: by + 1, version: bDoc.version });
+    await req('reviewer2', 'POST', `/api/docs/${btB}/masks/nod`, { start: by, end: by + 1, version: bDoc.version });
+    await req('author', 'POST', `/api/docs/${btA}/release`, { paragraph: 2 });
+    await req('author', 'POST', `/api/docs/${btB}/release`, { paragraph: 2 });
+    btPub = await req(null, 'GET', `/api/batches/${btId}/external`);
+    ok('差异遮齐 + 第三段补放：对外齐套', btPub.body.complete === true && btPub.body.visible === 3
+      && btPub.body.content === '批次首段甲。\n批次二段█。\n批次三段丙。'
+      && btPub.body.masks.some(m => m.len === 1));
+    ok('批次详情也报齐套', (await req('author', 'GET', `/api/batches/${btId}`)).body.complete === true);
+    // 没有退出/改批次的接口
+    ok('没有退出批次的接口', (await req('author', 'DELETE', `/api/batches/${btId}`)).status === 404);
+
     console.log(`\nHTTP 端到端全部通过：${passed} 项`);
   } finally {
     srv.kill();

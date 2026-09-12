@@ -144,3 +144,10 @@ span.mask-confirmed {
   position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
   background: #18181b; color: #fff; padding: 10px 18px; border-radius: 8px; z-index: 100;
 }
+
+/* 齐套批次 */
+#batchTable { margin-top: 8px; }
+.batch-pick { display: flex; flex-direction: column; gap: 4px; margin: 6px 0; }
+.batch-pick label { font-size: 14px; }
+.batch-detail-table td, .batch-detail-table th { font-size: 13px; padding: 4px 8px; }
+#batchCreate button { margin-top: 6px; }
