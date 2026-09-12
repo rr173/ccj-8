@@ -777,7 +777,7 @@ function renderCallbackCard() {
 // ---------- 泄露事故单 ----------
 const INCIDENT_STATUS = {
   visible: ['还看得到（泄露字仍在对外稿里）', 'rejected'],
-  masked: ['已抽空（该处只剩 █，原文翻不出来）', 'accepted'],
+  masked: ['已抽空（该处留空，原文翻不出来）', 'accepted'],
   absent: ['该渠道看不到这段（未放行/已召回）', 'proposed'],
   unvisible: ['对不上（外部没有这处字）', 'accepted'],
 };
@@ -818,7 +818,7 @@ async function openIncidentModal(callbackId, leakIndex) {
   $('#incidentModalBody').innerHTML = `
     <p class="hint">对 <b>渠道「${esc(rec.channel)}」第 ${rec.seq} 次回传的第 ${leakIndex + 1} 处泄露</b> 开事故单。</p>
     <p class="hint">请把登记这笔回传时系统返回过一次的<b>原始泄露片段</b>粘贴到下面（系统只与账上 SHA-256 指纹/字数核对，不落盘）。
-      核对一致才会开单；开出后任何渠道的对外稿里，对得上这处泄露的字立即抽空成 █。</p>
+      核对一致才会开单；开出后任何渠道的对外稿里，对得上这处泄露的那一行立即整行留空（无字、也无方块）。</p>
     <textarea id="incFrag" rows="4" placeholder="粘贴该处泄露的原始片段…"></textarea>
     <p class="error" id="incMsg"></p>`;
   $('#incidentModal').classList.remove('hidden');
@@ -830,7 +830,7 @@ async function openIncidentModal(callbackId, leakIndex) {
       });
       $('#incidentModal').classList.add('hidden');
       const n = (r.vacuumed || []).length;
-      toast(`事故单已开（不可改、不可撤）${n ? `；已抽空 ${n} 处对外快照` : '；该处一旦放行会自动抽空'}`);
+      toast(`事故单已开（不可改、不可撤）${n ? `；已把 ${n} 处对外快照整行留空` : '；该处一旦放行会自动留空'}`);
       await reloadDoc();
     } catch (e) {
       if (e.status === 409) { $('#incMsg').textContent = e.message; await reloadDoc(); }
@@ -993,8 +993,8 @@ const EVENT_TEXT = {
     return `渠道「${d.channel}」第 ${d.seq} 次回传：${parts.join('、')}（已记账，不可抹）`;
   },
   'review.closed': '审阅结束，对外稿冻结',
-  'incident.opened': d => `开出泄露事故单（渠道「${d.channel}」第 ${d.seq} 次回传第 ${d.leak + 1} 处泄露，${d.chars} 字）：不可改、不可撤；当场抽空对外快照 ${d.vacuumed} 处，以后对得上的字一律抽空`,
-  'release.incident-scrubbed': d => `事故单追加生效：放行快照抽空 ${d.len} 字（对得上泄露处的字，任何渠道都翻不出原文）`,
+  'incident.opened': d => `开出泄露事故单（渠道「${d.channel}」第 ${d.seq} 次回传第 ${d.leak + 1} 处泄露，${d.chars} 字）：不可改、不可撤；当场留空对外快照 ${d.vacuumed} 处，以后对得上的行一律留空`,
+  'release.incident-scrubbed': d => `事故单追加生效：放行快照整行留空（${d.len} 字，对得上泄露处的字，任何渠道都翻不出原文）`,
 };
 function kindName(k) { return k === 'mask' ? '遮罩提议' : k === 'suggest' ? '修改建议' : '批注'; }
 function renderEvents() {

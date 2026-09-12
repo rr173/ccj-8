@@ -459,17 +459,24 @@ async function nodBoth(docId, start, end, version) {
     ok('同一处泄露不能开两次', (await req('author', 'POST', `/api/docs/${inKid}/incidents`,
       { callbackId: inCbId, leakIndex: 0, fragment: inFrag })).status === 409);
 
-    // 放行第二段：事故单盯住段缝，立即抽空
+    // 放行第二段：事故单盯住段缝，立即抽空（留空行，不是方块）
     await req('author', 'POST', `/api/docs/${inKid}/release`, { paragraph: 1 });
     const inPub = (await req(null, 'GET', `/api/docs/${inKid}/external`)).body;
-    ok('公开口径对得上的字抽空', inPub.content === '事故首段甲。\n██████\n事故三段丙。'
-      && !inPub.content.includes('事故二段乙'));
+    ok('公开口径对得上的字留空（无字无方块）', inPub.content === '事故首段甲。\n\n事故三段丙。'
+      && !inPub.content.includes('事故二段乙') && !inPub.content.includes('█'));
     const inA = (await req(null, 'GET', `/api/docs/${inKid}/external?channel=${encodeURIComponent('渠道甲')}`)).body;
     const inB = (await req(null, 'GET', `/api/docs/${inKid}/external?channel=${encodeURIComponent('渠道乙')}`)).body;
-    ok('任何渠道都翻不出原文', !inA.content.includes('事故二段乙') && !inB.content.includes('事故二段乙'));
+    ok('任何渠道都翻不出原文，且留空而非方块',
+      !inA.content.includes('事故二段乙') && !inB.content.includes('事故二段乙')
+      && !inA.content.includes('█') && !inB.content.includes('█'));
     ok('对不上的字不跟着抽', inPub.content.includes('事故首段甲') && inPub.content.includes('事故三段丙'));
     // 内部正文不动
     ok('事故不改正文', (await req('author', 'GET', `/api/docs/${inKid}`)).body.content.includes('事故二段乙'));
+    // 留空行不被回传对账误记少发：照发抽空后视图 → 干净
+    const inEcho = await req('author', 'POST', `/api/docs/${inKid}/callbacks`,
+      { channel: '渠道甲', content: inPub.content });
+    ok('照发抽空后视图（含空行）：干净、无少发', inEcho.body.callback.clean === true
+      && inEcho.body.callback.missing.length === 0 && inEcho.body.callback.leak.count === 0);
 
     // 查账：开过哪些事故、对着哪些泄露、各渠道看不看得到
     const ledger = (await req('reviewer', 'GET', `/api/docs/${inKid}/incidents`)).body;
@@ -498,8 +505,9 @@ async function nodBoth(docId, start, end, version) {
       { callbackId: icRec.id, leakIndex: gapIdx, fragment: icCb.body.leakFragments[gapIdx] });
     ok('第二张事故单 201', opened2.status === 201 && opened2.body.vacuumed.length === 1);
     const icPub = (await req(null, 'GET', `/api/docs/${icKid}/external`)).body;
-    ok('被召回渠道泄露：公开口径也抽空',
-      !icPub.content.includes('连坐二段') && icPub.content.includes('连坐首段') && icPub.content.includes('连坐四段'));
+    ok('被召回渠道泄露：公开口径该段留空（不是方块）',
+      icPub.content === '连坐首段。\n\n连坐三段。\n连坐四段。'
+      && !icPub.content.includes('连坐二段') && !icPub.content.includes('█'));
 
     // 没有改/撤事故单的接口（PUT/DELETE 不存在 → 404）
     ok('没有撤销事故单的接口', (await req('author', 'DELETE',

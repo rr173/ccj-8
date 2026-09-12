@@ -857,18 +857,24 @@ async function main() {
   const errDup = await svc.openIncident(inDoc.id, inCbRec.id, 0, inFrag, 'author', (await svc.getDoc(inDoc.id)).version).then(() => null, e => e);
   ok('同一处泄露不能开两次', errDup && errDup.status === 409);
 
-  // 放行第二段：事故单盯住段缝，与泄露行逐字相同 → 立即抽空
+  // 放行第二段：事故单盯住段缝，与泄露行逐字相同 → 立即抽空（空行，不是方块）
   await svc.releaseParagraph(inDoc.id, 1, 'author', (await svc.getDoc(inDoc.id)).version);
   const inExt = await svc.external(inDoc.id);
-  ok('放行缝里的泄露段：公开口径这处抽空成 █',
-    inExt.content === '事故首段甲。\n██████\n事故三段丙。'
-    && !inExt.content.includes('事故二段乙'));
+  ok('放行缝里的泄露段：公开口径这处整行留空（无字、也无方块）',
+    inExt.content === '事故首段甲。\n\n事故三段丙。'
+    && !inExt.content.includes('事故二段乙') && !inExt.content.includes('█'));
   const inExtA = await svc.external(inDoc.id, '渠道甲');
   const inExtB = await svc.external(inDoc.id, '其他渠道');
-  ok('任何渠道（含没被召回的渠道）都对不上原文',
-    !inExtA.content.includes('事故二段乙') && !inExtB.content.includes('事故二段乙'));
+  ok('任何渠道（含没被召回的渠道）都对不上原文，且留空而非方块',
+    !inExtA.content.includes('事故二段乙') && !inExtB.content.includes('事故二段乙')
+    && !inExtA.content.includes('█') && !inExtB.content.includes('█'));
   ok('对不上的字（第一、三段）不跟着抽',
     inExt.content.includes('事故首段甲') && inExt.content.includes('事故三段丙'));
+
+  // 留空行的段不被回传对账误记少发（空行在场、但无可见字）：逐字照发公开视图 → 干净
+  const inEcho = await svc.registerCallback(inDoc.id, '渠道甲', inExt.content, 'author');
+  ok('照发抽空后的视图（含空行）：干净、无少发', inEcho.callback.clean === true
+    && inEcho.callback.missing.length === 0 && inEcho.callback.leak.count === 0);
 
   // 事故不改正文、不复活已遮字
   const inDocView = await svc.getDoc(inDoc.id);
@@ -912,8 +918,11 @@ async function main() {
     rc2Pub.content.includes('连坐首段甲') && rc2Pub.content.includes('连坐三段丙') && rc2Pub.content.includes('连坐四段丁'));
   const rc2Raw = JSON.parse(fs.readFileSync(path.join(tmp, 'data.json'), 'utf8'));
   const rc2Rel2 = rc2Raw.docs[rc2Doc.id].releases.find(r => r.paragraphIndex === 1);
-  ok('被抽段登记了事故来源（incidentScrubs）', rc2Rel2.anchor.match(/^⟦█+⟧$/)
+  ok('被抽段快照已清空（anchor 为空行、无方块）', rc2Rel2.anchor === ''
     && rc2Rel2.incidentScrubs[0].incident.startsWith('in_'));
+  // 该渠道视图里召回使整段缺席（parts 不含它），公开口径里它是【空行】
+  ok('公开口径保留空行（不是方块）', rc2Pub.content === '连坐首段甲。\n\n连坐三段丙。\n连坐四段丁。'
+    && !rc2Pub.content.includes('█'));
 
   // replace 型泄露（已遮代号按原文送回）：位置只可能变少，开单不抽任何字，状态可查
   const rpText = '代号ORION42机密。\n普通第二段。';
